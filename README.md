@@ -10,7 +10,7 @@ served by LM Studio. One file: `ai.py`.
 
 ```sh
 ai () {
-	curl -s https://raw.githubusercontent.com/taylorgoolsby/ai/main/ai.py | python3 - "$@"
+	curl -s https://raw.githubusercontent.com/taylorgoolsby/ai/master/ai.py | python3 - "$@"
 }
 ai, () { ai "$@"; }
 ```

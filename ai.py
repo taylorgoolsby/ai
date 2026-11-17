@@ -10,6 +10,9 @@ import argparse
 import importlib
 import json
 import os
+import re
+import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -127,6 +130,7 @@ class Tool:
     parameters: dict
     fn: Callable[..., str]
     dangerous: bool = False  # requires user approval
+    validate: Callable[..., str | None] | None = None  # returns a reason to hard-block the call
 
     def schema(self) -> dict:
         return {
@@ -137,6 +141,170 @@ class Tool:
 
 def _params(props: dict, required: list[str]) -> dict:
     return {"type": "object", "properties": props, "required": required}
+
+
+# --------------------------------------------------------------------------
+# Shell guardrails. These catch accidents (rm -rf /, sudo, cd / && rm *, force
+# pushes...) before the approval prompt is even shown. They are a seatbelt, not
+# a sandbox: `python -c "..."` can still do anything. Use a container for real
+# isolation.
+# --------------------------------------------------------------------------
+ALWAYS_BLOCKED = {
+    "sudo", "su", "doas", "pkexec", "mkswap", "fdisk", "sfdisk", "parted", "wipefs",
+    "shutdown", "reboot", "halt", "poweroff", "init", "telinit", "mount", "umount",
+    "chroot", "killall",
+}
+DESTRUCTIVE = {"rm", "rmdir", "mv", "shred", "truncate", "unlink"}
+MUTATORS = DESTRUCTIVE | {"cp", "chmod", "chown", "chgrp", "ln", "install", "rsync", "tee", "touch", "mkdir"}
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
+INTERPRETERS = SHELLS | {"python", "python3", "perl", "ruby", "node"}
+WRAPPERS = {"command", "builtin", "exec", "nohup", "time", "nice", "env", "stdbuf"}
+KNOWN = ALWAYS_BLOCKED | MUTATORS | SHELLS | {"find", "xargs", "git", "dd", "kill", "cd", "pushd", "eval"}
+OPERATOR_CHARS = set(";&|()`")
+REDIRECTS = {">", ">>", "&>", "&>>", ">|"}
+ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _tokenize(command: str) -> list[str]:
+    lex = shlex.shlex(command.replace("\n", " ; "), posix=True, punctuation_chars=";&|()`<>")
+    lex.whitespace_split = True
+    return list(lex)
+
+
+def _segments(tokens: list[str]) -> list[tuple[str, list[str]]]:
+    segs: list[tuple[str, list[str]]] = []
+    cur: list[str] = []
+    sep = ""
+    for t in tokens:
+        if t and set(t) <= OPERATOR_CHARS:
+            if cur:
+                segs.append((sep, cur))
+            cur, sep = [], t
+        else:
+            cur.append(t)
+    if cur:
+        segs.append((sep, cur))
+    return segs
+
+
+def _command_start(words: list[str]) -> list[str]:
+    i = 0
+    while i < len(words) and ASSIGN.match(words[i]):
+        i += 1
+    if i < len(words) and os.path.basename(words[i]) in WRAPPERS:
+        for j in range(i + 1, len(words)):
+            if os.path.basename(words[j]) in KNOWN:
+                return words[j:]
+        return words[i + 1:]
+    return words[i:]
+
+
+def _resolve_in_root(arg: str, root: Path) -> tuple[Path | None, str | None]:
+    if arg.startswith("~") or "$" in arg or "`" in arg:
+        return None, f"can't verify path '{arg}' (uses ~ or a variable); use a literal path inside the workspace"
+    p = (root / arg).resolve()
+    if not p.is_relative_to(root):
+        return None, f"path '{arg}' is outside the workspace"
+    return p, None
+
+
+def _check_words(sep: str, prev_cmd: str, words: list[str], root: Path, depth: int) -> str | None:
+    # redirections must stay inside the workspace (or /dev/null)
+    for i, t in enumerate(words):
+        if t in REDIRECTS and i + 1 < len(words) and words[i + 1] != "/dev/null":
+            _, err = _resolve_in_root(words[i + 1], root)
+            if err:
+                return f"redirect target: {err}"
+
+    words = _command_start(words)
+    if not words:
+        return None
+    cmd, args = os.path.basename(words[0]), words[1:]
+    flagless = [a for a in args if not a.startswith("-")]
+
+    if cmd in ALWAYS_BLOCKED or cmd.startswith("mkfs"):
+        return f"'{cmd}' is not allowed"
+    if sep == "|" and prev_cmd in {"curl", "wget"} and cmd in INTERPRETERS:
+        return "piping a download into a shell or interpreter is not allowed"
+    if cmd in SHELLS:
+        for i, a in enumerate(args):
+            if a.startswith("-") and not a.startswith("--") and "c" in a and i + 1 < len(args):
+                return shell_danger(args[i + 1], root, depth + 1)
+    if cmd == "eval":
+        return shell_danger(" ".join(args), root, depth + 1)
+    if cmd == "xargs":
+        if any(os.path.basename(a) in (MUTATORS | ALWAYS_BLOCKED | SHELLS) for a in args):
+            return "xargs with file-modifying commands is not allowed (paths can't be verified); name the paths or use find -delete"
+    if cmd in {"cd", "pushd"}:
+        if len(flagless) != 1 or flagless[0] == "-":
+            return "cd must name one directory inside the workspace"
+        _, err = _resolve_in_root(flagless[0], root)
+        if err:
+            return err
+    if cmd in MUTATORS:
+        targets = flagless[1:] if cmd in {"chmod", "chown", "chgrp"} else flagless
+        for a in targets:
+            p, err = _resolve_in_root(a, root)
+            if err:
+                return f"{cmd}: {err}"
+            if cmd in DESTRUCTIVE and p in (root, root / ".git"):
+                return f"{cmd}: refusing to modify the workspace root or .git"
+    if cmd == "dd":
+        for a in args:
+            if a.startswith("of="):
+                _, err = _resolve_in_root(a[3:], root)
+                if err:
+                    return f"dd: {err}"
+    if cmd == "kill" and any(a in {"-1", "0"} for a in args):
+        return "kill -1 / kill 0 would signal every process"
+    if cmd == "find":
+        starts = []
+        for a in args:
+            if a.startswith("-") or a in {"!", "("}:
+                break
+            starts.append(a)
+        if "-delete" in args:
+            for a in starts or ["."]:
+                _, err = _resolve_in_root(a, root)
+                if err:
+                    return f"find -delete: {err}"
+        for i, a in enumerate(args):
+            if a in {"-exec", "-execdir", "-ok", "-okdir"}:
+                r = _check_words("", "", args[i + 1:], root, depth)
+                if r:
+                    return r
+    if cmd == "git":
+        rest = list(args)
+        while rest and rest[0] in {"-C", "-c"}:
+            rest = rest[2:]
+        sub = next((a for a in rest if not a.startswith("-")), "")
+        if sub == "clean":
+            return "git clean deletes untracked files; ask the user to run it"
+        if sub == "reset" and "--hard" in rest:
+            return "git reset --hard discards uncommitted work; ask the user to run it"
+        if sub == "push" and any(a == "-f" or a.startswith("--force") for a in rest):
+            return "force-pushing is not allowed"
+    return None
+
+
+def shell_danger(command: str, root: Path, depth: int = 0) -> str | None:
+    """Return a reason if the command looks dangerous, else None."""
+    if depth > 3:
+        return "commands nested too deeply to verify"
+    if re.search(r":\s*\(\s*\)\s*\{", command):
+        return "fork bomb"
+    try:
+        tokens = _tokenize(command)
+    except ValueError as e:
+        return f"can't parse command ({e})"
+    prev_cmd = ""
+    for sep, words in _segments(tokens):
+        reason = _check_words(sep, prev_cmd, words, root, depth)
+        if reason:
+            return reason
+        start = _command_start(words)
+        prev_cmd = os.path.basename(start[0]) if start else ""
+    return None
 
 
 class Toolbox:
@@ -205,14 +373,24 @@ class Toolbox:
                 continue
         return "\n".join(hits) or "No matches"
 
+    def _validate_shell(self, command: str) -> str | None:
+        return shell_danger(command, self.root)
+
     def run_shell(self, command: str) -> str:
+        reason = self._validate_shell(command)
+        if reason:
+            return f"Blocked: {reason}"
+        proc = subprocess.Popen(
+            command, shell=True, cwd=self.root, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        )
         try:
-            r = subprocess.run(
-                command, shell=True, cwd=self.root, capture_output=True, text=True, timeout=120
-            )
+            out, err = proc.communicate(timeout=120)
         except subprocess.TimeoutExpired:
-            return "Error: command timed out after 120s"
-        return f"exit code {r.returncode}\n{r.stdout}{r.stderr}"
+            os.killpg(proc.pid, signal.SIGKILL)  # kill the whole process group, not just the shell
+            proc.communicate()
+            return "Error: command timed out after 120s and was killed"
+        return f"exit code {proc.returncode}\n{out}{err}"
 
     def _build(self) -> list[Tool]:
         s = {"type": "string"}
@@ -226,7 +404,8 @@ class Toolbox:
             Tool("edit_file", "Replace one exact occurrence of 'old' with 'new' in a file.",
                  _params({"path": s, "old": s, "new": s}, ["path", "old", "new"]), self.edit_file, dangerous=True),
             Tool("run_shell", "Run a shell command in the workspace root.",
-                 _params({"command": s}, ["command"]), self.run_shell, dangerous=True),
+                 _params({"command": s}, ["command"]), self.run_shell, dangerous=True,
+                 validate=self._validate_shell),
         ]
 
 
@@ -279,7 +458,16 @@ class Agent:
         else:
             emit("tool", f"{name} {json.dumps(args)[:200]}")
             tool = self.toolbox.tools.get(name)
-            if tool and tool.dangerous and not approve(name, args):
+            reason = None
+            if tool and tool.validate:
+                try:
+                    reason = tool.validate(**args)
+                except TypeError:
+                    pass  # bad arguments get reported by execute()
+            if reason:
+                result = f"Blocked: {reason}. Don't retry this; pick a safer approach or ask the user."
+                emit("error", f"blocked {name}: {reason}")
+            elif tool and tool.dangerous and not approve(name, args):
                 result = "User denied this action."
                 emit("error", f"denied: {name}")
             else:
