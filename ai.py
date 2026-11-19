@@ -16,6 +16,8 @@ import signal
 import subprocess
 import sys
 import threading
+import time
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -144,25 +146,71 @@ def _params(props: dict, required: list[str]) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Shell guardrails. These catch accidents (rm -rf /, sudo, cd / && rm *, force
-# pushes...) before the approval prompt is even shown. They are a seatbelt, not
-# a sandbox: `python -c "..."` can still do anything. Use a container for real
-# isolation.
+# Shell guardrails. These block known-dangerous commands before the approval
+# prompt is even shown: privilege escalation, deleting outside the workspace or
+# .git (including via variables, globs and brace expansion), reading or writing
+# paths outside the workspace, sending secrets files over the network, running
+# downloaded files, destructive git operations, and so on. Commands also run
+# with a scrubbed environment (see _clean_env).
+# They are a seatbelt, not a sandbox: code run through an interpreter
+# (`python3 -c ...`, or a script written with write_file) is not inspected, and
+# network access is not restricted. Use a container for real isolation.
 # --------------------------------------------------------------------------
 ALWAYS_BLOCKED = {
     "sudo", "su", "doas", "pkexec", "mkswap", "fdisk", "sfdisk", "parted", "wipefs",
     "shutdown", "reboot", "halt", "poweroff", "init", "telinit", "mount", "umount",
     "chroot", "killall",
+    "watch", "crontab",  # run command strings / schedule persistent jobs
 }
 DESTRUCTIVE = {"rm", "rmdir", "mv", "shred", "truncate", "unlink"}
 MUTATORS = DESTRUCTIVE | {"cp", "chmod", "chown", "chgrp", "ln", "install", "rsync", "tee", "touch", "mkdir"}
 SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish"}
-INTERPRETERS = SHELLS | {"python", "python3", "perl", "ruby", "node"}
-WRAPPERS = {"command", "builtin", "exec", "nohup", "time", "nice", "env", "stdbuf"}
-KNOWN = ALWAYS_BLOCKED | MUTATORS | SHELLS | {"find", "xargs", "git", "dd", "kill", "cd", "pushd", "eval"}
+INTERPRETERS = SHELLS | {"python", "python3", "perl", "ruby", "node", "php", "deno", "bun", "lua"}
+SOURCERS = {"source", "."}
+# Commands that read files; their path arguments must stay inside the workspace,
+# the same rule the read_file tool follows.
+READERS = {
+    "cat", "tac", "head", "tail", "less", "more", "nl", "wc", "sort", "uniq", "cut", "strings", "xxd", "od",
+    "hexdump", "base64", "file", "stat", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "realpath",
+    "readlink", "grep", "egrep", "fgrep", "rg", "ag", "awk", "sed", "ls", "tree", "du",
+    "zip", "unzip", "gzip", "gunzip",
+}
+PATTERN_FIRST = {"grep", "egrep", "fgrep", "rg", "ag", "awk", "sed"}  # first positional is a pattern/script
+_PATTERN_OPTS = {"-e", "-f", "--regexp", "--file", "--expression"}
+_READER_SHORT_VALUES = {"grep": "efABCm", "egrep": "efABCm", "fgrep": "efABCm", "rg": "efABCmgt",
+                        "ag": "ABC", "awk": "Ffv", "sed": "ef"}
+_READER_LONG_VALUES = {"--regexp", "--file", "--expression"}
+# Wrappers run another command given as their arguments (`timeout 5 rm -rf x`).
+WRAPPERS = {"command", "builtin", "exec", "nohup", "time", "nice", "env", "stdbuf", "timeout", "setsid",
+            "ionice", "taskset", "chrt", "flock", "caffeinate", "unbuffer", "busybox", "toybox"}
+# Shell reserved words that can precede a command (`do rm x`, `then sudo ls`, `{ rm x; }`).
+KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"}
+NETWORK_GET = {"curl", "wget"}
+KNOWN = (ALWAYS_BLOCKED | MUTATORS | SHELLS | READERS | NETWORK_GET
+         | {"find", "xargs", "git", "dd", "kill", "cd", "pushd", "eval", "tar", "source"})
 OPERATOR_CHARS = set(";&|()`")
-REDIRECTS = {">", ">>", "&>", "&>>", ">|"}
+REDIRECTS = {">", ">>", "&>", "&>>", ">|", ">&"}
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+SENSITIVE_FILE = re.compile(
+    r"(^|/)(\.env(\..+)?|\.netrc|\.npmrc|\.pypirc|\.git-credentials|credentials|id_(rsa|dsa|ecdsa|ed25519)"
+    r"|.+\.(pem|key|p12|pfx|jks|keystore)|secrets?(\.[a-z]+)?)$", re.I)
+# git config keys that make git run arbitrary commands
+_RISKY_GIT_CONFIG = re.compile(
+    r"^(alias\.|core\.(sshcommand|fsmonitor|pager|editor|hookspath|askpass|gitproxy)|credential\.|filter\.|"
+    r"diff\..*\.(textconv|command)|merge\..*\.driver|gpg\.program|sequence\.editor|url\..*\.insteadof)")
+_HEREDOC = re.compile(r"(?<!<)<<(?!<)-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+_RUNS_STDIN = re.compile(r"\b(sh|bash|zsh|dash|ksh|fish|python[\d.]*|perl|ruby|node|php|deno|bun|lua|eval|source|xargs)\b")
+
+_FETCH_WRITES = {  # (short flags taking a path we'd write, long flags)
+    "curl": ("oDc", {"--output", "--dump-header", "--cookie-jar", "--output-dir", "--stderr", "--trace",
+                     "--trace-ascii", "--etag-save"}),
+    "wget": ("OPoa", {"--output-document", "--directory-prefix", "--output-file", "--append-output"}),
+}
+_FETCH_SENDS = {  # options whose value is a local file that would be read/uploaded
+    "curl": ("TK", {"--upload-file", "--config"}),
+    "wget": ("", {"--post-file", "--body-file"}),
+}
+_CURL_DATA = ("dF", {"--data", "--data-binary", "--data-urlencode", "--data-ascii", "--form", "--json"})
 
 
 def _tokenize(command: str) -> list[str]:
@@ -176,7 +224,8 @@ def _segments(tokens: list[str]) -> list[tuple[str, list[str]]]:
     cur: list[str] = []
     sep = ""
     for t in tokens:
-        if t and set(t) <= OPERATOR_CHARS:
+        # `<(` and `>(` (process substitution) start a nested command just like `(`
+        if t and (set(t) <= OPERATOR_CHARS or (t[-1] == "(" and set(t) <= OPERATOR_CHARS | {"<", ">"})):
             if cur:
                 segs.append((sep, cur))
             cur, sep = [], t
@@ -189,13 +238,19 @@ def _segments(tokens: list[str]) -> list[tuple[str, list[str]]]:
 
 def _command_start(words: list[str]) -> list[str]:
     i = 0
-    while i < len(words) and ASSIGN.match(words[i]):
+    while i < len(words) and (ASSIGN.match(words[i]) or words[i] in KEYWORDS):
         i += 1
     if i < len(words) and os.path.basename(words[i]) in WRAPPERS:
         for j in range(i + 1, len(words)):
             if os.path.basename(words[j]) in KNOWN:
                 return words[j:]
-        return words[i + 1:]
+        # unknown command behind a wrapper: skip the wrapper's own flags/numbers/assignments
+        rest = words[i + 1:]
+        k = 0
+        while k < len(rest) and (rest[k].startswith("-") or ASSIGN.match(rest[k])
+                                 or re.fullmatch(r"[\d.]+[smhd]?", rest[k])):
+            k += 1
+        return rest[k:]
     return words[i:]
 
 
@@ -208,33 +263,355 @@ def _resolve_in_root(arg: str, root: Path) -> tuple[Path | None, str | None]:
     return p, None
 
 
-def _check_words(sep: str, prev_cmd: str, words: list[str], root: Path, depth: int) -> str | None:
+def _getopt(args: list[str], short_val: str = "", long_val=(), short_opt: str = "") -> tuple[list[tuple[str, str | None]], list[str]]:
+    """Tiny getopt. Returns (opts, positionals); opts are (name, value-or-None).
+    short_val: short flags that take a value (attached `-ofile` or next arg).
+    short_opt: short flags whose value, if any, must be attached (sed -i[SUFFIX])."""
+    opts: list[tuple[str, str | None]] = []
+    pos: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            pos.extend(args[i + 1:])
+            break
+        if a.startswith("--"):
+            name, eq, val = a.partition("=")
+            if name in long_val and not eq:
+                opts.append((name, args[i + 1] if i + 1 < len(args) else None))
+                i += 1
+            else:
+                opts.append((name, val if eq else None))
+        elif a.startswith("-") and len(a) > 1:
+            j = 1
+            while j < len(a):
+                c = a[j]
+                if c in short_val:
+                    rest = a[j + 1:]
+                    if rest:
+                        opts.append(("-" + c, rest))
+                    else:
+                        opts.append(("-" + c, args[i + 1] if i + 1 < len(args) else None))
+                        i += 1
+                    break
+                if c in short_opt:
+                    opts.append(("-" + c, a[j + 1:]))
+                    break
+                opts.append(("-" + c, None))
+                j += 1
+        else:
+            pos.append(a)
+        i += 1
+    return opts, pos
+
+
+def _brace_expand(s: str, limit: int = 256) -> list[str] | None:
+    """Expand {a,b} alternatives like a shell so every result can be checked.
+    Returns None if that would produce more than `limit` paths."""
+    for m in re.finditer(r"\{([^{}]*)\}", s):
+        if "," in m.group(1):
+            out: list[str] = []
+            for alt in m.group(1).split(","):
+                sub = _brace_expand(s[:m.start()] + alt + s[m.end():], limit)
+                if sub is None:
+                    return None
+                out += sub
+                if len(out) > limit:
+                    return None
+            return out
+    return [s]
+
+
+def _dot_glob(path: str) -> bool:
+    """True for patterns like .* or .g* that the shell would expand to hidden files such as .git."""
+    return any(p.startswith(".") and p not in (".", "..") and any(c in p for c in "*?[") for p in path.split("/"))
+
+
+def _is_interpreter(cmd: str) -> bool:
+    return cmd in INTERPRETERS or bool(re.fullmatch(r"(python|pypy|ruby|perl|node)[\d.]+", cmd))
+
+
+def _check_read_path(cmd: str, a: str, root: Path) -> str | None:
+    """Reads must stay inside the workspace. Unverifiable $VAR paths are let through
+    (loops over files are common) except $HOME."""
+    if a in ("", "-", "/dev/null"):
+        return None
+    if "$" in a:
+        return f"{cmd}: can't read paths under $HOME" if re.search(r"\$\{?HOME\b", a) else None
+    _, err = _resolve_in_root(a, root)
+    return f"{cmd}: {err}" if err else None
+
+
+def _check_send_path(cmd: str, ref: str, root: Path) -> str | None:
+    ref = ref.strip()
+    if ref in ("", "-"):
+        return None
+    p, err = _resolve_in_root(ref, root)
+    if err:
+        return f"{cmd}: {err}"
+    if SENSITIVE_FILE.search(str(p)):
+        return f"{cmd}: refusing to send '{ref}' (looks like a secrets file)"
+    return None
+
+
+def _data_refs(name: str, value: str) -> list[str]:
+    """Local files a curl data option would upload (-d @file, -F name=@file, ...)."""
+    if value.startswith("@"):
+        return [value[1:]]
+    if name in ("-F", "--form"):
+        m = re.match(r"^[^=]*=[@<]([^;]+)", value)
+        return [m.group(1)] if m else []
+    if name == "--data-urlencode":
+        m = re.match(r"^[^=@]*@(.+)$", value)
+        return [m.group(1)] if m else []
+    return []
+
+
+def _check_fetch(cmd: str, args: list[str], root: Path) -> str | None:
+    w_short, w_long = _FETCH_WRITES[cmd]
+    s_short, s_long = _FETCH_SENDS[cmd]
+    d_short, d_long = _CURL_DATA if cmd == "curl" else ("", set())
+    writes = {"-" + c for c in w_short} | set(w_long)
+    sends = {"-" + c for c in s_short} | set(s_long)
+    data = {"-" + c for c in d_short} | set(d_long)
+    opts, _ = _getopt(args, short_val=w_short + s_short + d_short, long_val=set(w_long) | set(s_long) | set(d_long))
+    for name, value in opts:
+        if value is None:
+            continue
+        if name in writes:
+            if value in ("-", "/dev/null"):
+                continue
+            _, err = _resolve_in_root(value, root)
+            if err:
+                return f"{cmd}: {err}"
+        elif name in sends:
+            reason = _check_send_path(cmd, value, root)
+            if reason:
+                return reason
+        elif name in data:
+            for ref in _data_refs(name, value):
+                reason = _check_send_path(cmd, ref, root)
+                if reason:
+                    return reason
+    return None
+
+
+def _check_tar(args: list[str], root: Path) -> str | None:
+    targs = list(args)
+    if targs and not targs[0].startswith("-") and re.fullmatch(r"[A-Za-z]+", targs[0]):
+        targs[0] = "-" + targs[0]  # old-style `tar xf a.tar`
+    opts, pos = _getopt(targs, short_val="CfT", long_val={"--directory", "--file", "--files-from"})
+    names = {n for n, _ in opts}
+    if names & {"-P", "--absolute-names"}:
+        return "tar: absolute names are not allowed"
+    if names & {"-I", "-F", "--use-compress-program", "--to-command", "--checkpoint-action", "--rsh-command",
+                "--info-script", "--new-volume-script"}:
+        return "tar: that option can run arbitrary commands"
+    for n, v in opts:
+        if n in {"-C", "-f", "-T", "--directory", "--file", "--files-from"} and v and v != "-":
+            _, err = _resolve_in_root(v, root)
+            if err:
+                return f"tar: {err}"
+    if names & {"-c", "--create", "-r", "--append", "-u", "--update"}:
+        for a in pos:
+            reason = _check_read_path("tar", a, root)
+            if reason:
+                return reason
+    return None
+
+
+def _check_git(args: list[str], root: Path) -> str | None:
+    rest = list(args)
+    while rest and rest[0].startswith("-"):
+        flag = rest[0]
+        if flag in ("-C", "-c") and len(rest) > 1:
+            value = rest[1]
+            if flag == "-C":
+                _, err = _resolve_in_root(value, root)
+                if err:
+                    return f"git -C: {err}"
+            else:
+                key = value.split("=", 1)[0]
+                if _RISKY_GIT_CONFIG.match(key.lower()):
+                    return f"git -c {key}: can make git run arbitrary commands"
+            rest = rest[2:]
+        elif flag.startswith(("--git-dir", "--work-tree")):
+            name, eq, value = flag.partition("=")
+            if not eq and len(rest) > 1:
+                value = rest[1]
+            if value:
+                _, err = _resolve_in_root(value, root)
+                if err:
+                    return f"git {name}: {err}"
+            rest = rest[1:] if eq else rest[2:]
+        else:
+            rest = rest[1:]
+    sub = rest[0] if rest else ""
+    sargs = rest[1:]
+    flags = [a for a in sargs if a.startswith("-")]
+    shorts = set("".join(f[1:] for f in flags if not f.startswith("--")))
+    longs = {f.split("=")[0] for f in flags if f.startswith("--")}
+    positional = [a for a in sargs if not a.startswith("-")]
+    first = positional[0] if positional else ""
+
+    if sub == "clean":
+        return "git clean deletes untracked files; ask the user to run it"
+    if sub == "reset" and "--hard" in sargs:
+        return "git reset --hard discards uncommitted work; ask the user to run it"
+    if sub == "push":
+        if "f" in shorts or "d" in shorts or any(l.startswith("--force") for l in longs) \
+                or longs & {"--mirror", "--prune", "--delete"}:
+            return "force-pushing or deleting remote refs is not allowed"
+        if any(a.startswith(("+", ":")) for a in positional):
+            return "a +refspec or :ref push can overwrite or delete remote history; ask the user to run it"
+    if sub == "checkout" and ("--" in sargs or "." in sargs or "f" in shorts or "--force" in longs):
+        return "git checkout can discard uncommitted changes; ask the user to run it"
+    if sub == "restore":
+        staged_only = ("--staged" in longs or "S" in shorts) and not ("--worktree" in longs or "W" in shorts)
+        if not staged_only:
+            return "git restore discards uncommitted changes; ask the user to run it"
+    if sub == "switch" and ("f" in shorts or longs & {"--force", "--discard-changes"}):
+        return "git switch --force discards uncommitted changes; ask the user to run it"
+    if sub == "branch" and ("D" in shorts or ("d" in shorts and "f" in shorts)
+                            or ("--delete" in longs and "--force" in longs)
+                            or ("--force" in longs and "d" in shorts)):
+        return "force-deleting a branch is not allowed; ask the user to run it"
+    if sub == "stash" and first in {"drop", "clear"}:
+        return "git stash drop/clear discards saved work; ask the user to run it"
+    if sub == "reflog" and first in {"expire", "delete"}:
+        return "git reflog expire/delete destroys recovery points; ask the user to run it"
+    if sub == "gc" and any(l.startswith("--prune") for l in longs):
+        return "git gc --prune permanently deletes objects; ask the user to run it"
+    if sub in {"prune", "filter-branch", "filter-repo", "update-ref"}:
+        return f"git {sub} rewrites or destroys history; ask the user to run it"
+    return None
+
+
+def _strip_heredocs(command: str) -> str:
+    """Drop heredoc bodies (they're data, e.g. file contents) unless the same line
+    feeds them to an interpreter, in which case the body is code and stays checked."""
+    out: list[str] = []
+    pending: tuple[str, bool, bool] | None = None  # (delimiter, dash form, keep body)
+    for line in command.split("\n"):
+        if pending:
+            delim, dash, keep = pending
+            if (line.lstrip("\t") if dash else line) == delim:
+                pending = None
+            if keep:
+                out.append(line)
+            continue
+        out.append(line)
+        m = _HEREDOC.search(line)
+        if m:
+            pending = (m.group(2), line[m.start():].startswith("<<-"), bool(_RUNS_STDIN.search(line)))
+    return "\n".join(out)
+
+
+def _download_outputs(command: str, root: Path) -> set[Path]:
+    """Files a curl/wget in this command line would create (so we can refuse to run them)."""
+    out: set[Path] = set()
+    try:
+        tokens = _tokenize(_strip_heredocs(command))
+    except ValueError:
+        return out
+    prev = ""
+    for _, words in _segments(tokens):
+        start = _command_start(words)
+        cmd = os.path.basename(start[0]) if start else ""
+        args = start[1:] if start else []
+        names: list[str] = []
+        if cmd in NETWORK_GET:
+            w_short, w_long = _FETCH_WRITES[cmd]
+            writes = {"-" + c for c in w_short} | set(w_long)
+            opts, pos = _getopt(args, short_val=w_short, long_val=set(w_long))
+            explicit = [v for n, v in opts if n in writes and v]
+            prefix = next((v for n, v in opts if n in {"-P", "--directory-prefix", "--output-dir"} and v), "")
+            names += explicit
+            named_output = any(n in {"-O", "--output-document"} and v for n, v in opts) if cmd == "wget" else False
+            remote_name = any(n in {"-O", "--remote-name", "--remote-name-all"} for n, _ in opts) if cmd == "curl" else not named_output
+            if remote_name:
+                for u in pos:
+                    if "://" in u:
+                        base = os.path.basename(urlparse(u).path.rstrip("/")) or "index.html"
+                        names.append(os.path.join(prefix, base) if prefix else base)
+            for i, t in enumerate(words[:-1]):
+                if t in REDIRECTS:
+                    names.append(words[i + 1])
+        elif cmd == "tee" and prev in NETWORK_GET:
+            names += [a for a in args if not a.startswith("-")]
+        for n in names:
+            if n and "$" not in n and n not in ("-", "/dev/null"):
+                out.add((root / n).resolve())
+        prev = cmd
+    return out
+
+
+def _check_words(sep: str, prev_cmd: str, words: list[str], root: Path, depth: int, tainted: set[Path]) -> str | None:
     # redirections must stay inside the workspace (or /dev/null)
-    for i, t in enumerate(words):
-        if t in REDIRECTS and i + 1 < len(words) and words[i + 1] != "/dev/null":
-            _, err = _resolve_in_root(words[i + 1], root)
+    stdin_files: list[Path | None] = []
+    for i, t in enumerate(words[:-1]):
+        target = words[i + 1]
+        if t in REDIRECTS:
+            if target == "/dev/null" or (t == ">&" and (target.isdigit() or target == "-")):
+                continue
+            _, err = _resolve_in_root(target, root)
             if err:
                 return f"redirect target: {err}"
+        elif t == "<" and target != "/dev/null":
+            p, err = _resolve_in_root(target, root)
+            if err:
+                return f"input redirect: {err}"
+            stdin_files.append(p)
+
+    if "env" in {os.path.basename(w) for w in words} and any(
+            w == "-S" or w.startswith(("-S", "--split-string")) for w in words):
+        return "env -S runs a command string that can't be verified"
 
     words = _command_start(words)
     if not words:
         return None
-    cmd, args = os.path.basename(words[0]), words[1:]
+    head = words[0]
+    cmd, args = os.path.basename(head), words[1:]
     flagless = [a for a in args if not a.startswith("-")]
+
+    # `x=rm; $x -rf /`, `rm${IFS}-rf${IFS}/`, `.*` ... the shell expands these after we looked
+    if head not in ("[", "[[") and (re.search(r"[$*?{\[]", head) or head.startswith("~")):
+        return f"can't verify command '{head}' (variable, glob or expansion in the command name)"
 
     if cmd in ALWAYS_BLOCKED or cmd.startswith("mkfs"):
         return f"'{cmd}' is not allowed"
-    if sep == "|" and prev_cmd in {"curl", "wget"} and cmd in INTERPRETERS:
-        return "piping a download into a shell or interpreter is not allowed"
+
+    interp = _is_interpreter(cmd)
+    if sep.startswith("|") and interp:
+        if prev_cmd in NETWORK_GET:
+            return "piping a download into a shell or interpreter is not allowed"
+        o, p = _getopt(args, short_val="cmeEpWXr")
+        if not any(n in ("-c", "-m", "-e", "-E", "-p") for n, _ in o) and not [x for x in p if x != "-"]:
+            return "piping into a bare interpreter would run unreviewed code; write it to a file first"
     if cmd in SHELLS:
         for i, a in enumerate(args):
             if a.startswith("-") and not a.startswith("--") and "c" in a and i + 1 < len(args):
-                return shell_danger(args[i + 1], root, depth + 1)
+                return shell_danger(args[i + 1], root, depth + 1, tainted)
     if cmd == "eval":
-        return shell_danger(" ".join(args), root, depth + 1)
+        return shell_danger(" ".join(args), root, depth + 1, tainted)
     if cmd == "xargs":
         if any(os.path.basename(a) in (MUTATORS | ALWAYS_BLOCKED | SHELLS) for a in args):
             return "xargs with file-modifying commands is not allowed (paths can't be verified); name the paths or use find -delete"
+
+    # never run something a download command produced (here or earlier in the session)
+    if interp or cmd in SOURCERS:
+        _, scripts = _getopt(args, short_val="cmeEpWXr")
+        for a in scripts:
+            p, _ = _resolve_in_root(a, root)
+            if p is not None and p in tainted:
+                return f"'{a}' was downloaded by a command; ask the user to review and run it"
+        if any(f is not None and f in tainted for f in stdin_files):
+            return "refusing to feed a downloaded file to an interpreter; ask the user to review and run it"
+    if "/" in head:
+        p, _ = _resolve_in_root(head, root)
+        if p is not None and p in tainted:
+            return f"'{head}' was downloaded by a command; ask the user to review and run it"
+
     if cmd in {"cd", "pushd"}:
         if len(flagless) != 1 or flagless[0] == "-":
             return "cd must name one directory inside the workspace"
@@ -243,63 +620,85 @@ def _check_words(sep: str, prev_cmd: str, words: list[str], root: Path, depth: i
             return err
     if cmd in MUTATORS:
         targets = flagless[1:] if cmd in {"chmod", "chown", "chgrp"} else flagless
-        for a in targets:
-            p, err = _resolve_in_root(a, root)
-            if err:
-                return f"{cmd}: {err}"
-            if cmd in DESTRUCTIVE and p in (root, root / ".git"):
-                return f"{cmd}: refusing to modify the workspace root or .git"
+        for raw in targets:
+            expanded = _brace_expand(raw)
+            if expanded is None:
+                return f"{cmd}: too many brace alternatives in '{raw}' to verify"
+            for a in expanded:
+                if cmd in DESTRUCTIVE and _dot_glob(a):
+                    return f"{cmd}: '{a}' is a glob that could match .git or other hidden files"
+                p, err = _resolve_in_root(a, root)
+                if err:
+                    return f"{cmd}: {err}"
+                if cmd in DESTRUCTIVE and (p == root or p.is_relative_to(root / ".git")):
+                    return f"{cmd}: refusing to modify the workspace root or .git"
     if cmd == "dd":
         for a in args:
-            if a.startswith("of="):
+            if a.startswith(("of=", "if=")):
                 _, err = _resolve_in_root(a[3:], root)
                 if err:
                     return f"dd: {err}"
     if cmd == "kill" and any(a in {"-1", "0"} for a in args):
         return "kill -1 / kill 0 would signal every process"
+
+    if cmd in READERS:
+        opts, pos = _getopt(args, short_val=_READER_SHORT_VALUES.get(cmd, ""),
+                            long_val=_READER_LONG_VALUES, short_opt="i" if cmd == "sed" else "")
+        if cmd in PATTERN_FIRST and pos and not any(n in _PATTERN_OPTS for n, _ in opts):
+            pos = pos[1:]  # the pattern / script, not a path
+        for a in pos:
+            reason = _check_read_path(cmd, a, root)
+            if reason:
+                return reason
+    if cmd in NETWORK_GET:
+        reason = _check_fetch(cmd, args, root)
+        if reason:
+            return reason
+    if cmd == "tar":
+        reason = _check_tar(args, root)
+        if reason:
+            return reason
     if cmd == "find":
         starts = []
         for a in args:
             if a.startswith("-") or a in {"!", "("}:
                 break
             starts.append(a)
-        if "-delete" in args:
-            for a in starts or ["."]:
+        for a in starts or ["."]:
+            if "-delete" in args:
                 _, err = _resolve_in_root(a, root)
                 if err:
                     return f"find -delete: {err}"
+            else:
+                reason = _check_read_path("find", a, root)
+                if reason:
+                    return reason
         for i, a in enumerate(args):
             if a in {"-exec", "-execdir", "-ok", "-okdir"}:
-                r = _check_words("", "", args[i + 1:], root, depth)
+                r = _check_words("", "", args[i + 1:], root, depth, tainted)
                 if r:
                     return r
     if cmd == "git":
-        rest = list(args)
-        while rest and rest[0] in {"-C", "-c"}:
-            rest = rest[2:]
-        sub = next((a for a in rest if not a.startswith("-")), "")
-        if sub == "clean":
-            return "git clean deletes untracked files; ask the user to run it"
-        if sub == "reset" and "--hard" in rest:
-            return "git reset --hard discards uncommitted work; ask the user to run it"
-        if sub == "push" and any(a == "-f" or a.startswith("--force") for a in rest):
-            return "force-pushing is not allowed"
+        return _check_git(args, root)
     return None
 
 
-def shell_danger(command: str, root: Path, depth: int = 0) -> str | None:
-    """Return a reason if the command looks dangerous, else None."""
+def shell_danger(command: str, root: Path, depth: int = 0, downloaded: set[Path] | None = None) -> str | None:
+    """Return a reason if the command looks dangerous, else None.
+    `downloaded` holds files that earlier curl/wget commands in this session created."""
     if depth > 3:
         return "commands nested too deeply to verify"
+    command = _strip_heredocs(command)
     if re.search(r":\s*\(\s*\)\s*\{", command):
         return "fork bomb"
     try:
         tokens = _tokenize(command)
     except ValueError as e:
         return f"can't parse command ({e})"
+    tainted = set(downloaded or ()) | _download_outputs(command, root)
     prev_cmd = ""
     for sep, words in _segments(tokens):
-        reason = _check_words(sep, prev_cmd, words, root, depth)
+        reason = _check_words(sep, prev_cmd, words, root, depth, tainted)
         if reason:
             return reason
         start = _command_start(words)
@@ -307,9 +706,34 @@ def shell_danger(command: str, root: Path, depth: int = 0) -> str | None:
     return None
 
 
+# Environment variables commands may see. Everything else (API keys, cloud
+# credentials, tokens...) is withheld. Extend with AI_PASSTHROUGH_ENV=NAME1,NAME2.
+SAFE_ENV = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TERM", "TMPDIR", "TZ",
+            "VIRTUAL_ENV", "COLORTERM", "NO_COLOR"}
+
+
+def _clean_env() -> dict[str, str]:
+    keep = SAFE_ENV | {n.strip() for n in os.getenv("AI_PASSTHROUGH_ENV", "").split(",") if n.strip()}
+    return {k: v for k, v in os.environ.items() if k in keep or k.startswith("LC_")}
+
+
+def _as_int(value, name: str, minimum: int = 0) -> int | None:
+    """Models sometimes send numbers as strings ("10") or floats (10.0); accept both."""
+    if value is None or value == "":
+        return None
+    try:
+        n = int(float(value))
+    except (TypeError, ValueError):
+        raise ValueError(f"'{name}' must be an integer, got {value!r}")
+    if n < minimum:
+        raise ValueError(f"'{name}' must be >= {minimum}, got {n}")
+    return n
+
+
 class Toolbox:
     def __init__(self, root: Path):
         self.root = root.resolve()
+        self.downloaded: set[Path] = set()  # files created by curl/wget in this session; never executed
         self.tools: dict[str, Tool] = {t.name: t for t in self._build()}
 
     def schemas(self) -> list[dict]:
@@ -337,8 +761,39 @@ class Toolbox:
         rows = sorted(d.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
         return "\n".join(f"{p.name}{'/' if p.is_dir() else ''}" for p in rows if p.name not in SKIP_DIRS) or "(empty)"
 
-    def read_file(self, path: str) -> str:
-        return self._path(path).read_text(errors="replace")
+    def read_file(self, path: str, offset: int | None = None, limit: int | None = None) -> str:
+        """Read a text file. `offset` is the zero-based index of the first line to
+        return; `limit` is the max number of lines. With neither, returns the whole
+        file. If the result is too big it is cut at a line boundary and a note says
+        which offset to use to continue."""
+        start = _as_int(offset, "offset") or 0
+        count = _as_int(limit, "limit", minimum=1)
+        lines = self._path(path).read_text(errors="replace").splitlines(keepends=True)
+        total = len(lines)
+        if start == 0 and count is None and sum(len(l) for l in lines) <= MAX_OUT:
+            return "".join(lines)  # fast path: whole small file, unchanged behaviour
+        if start >= total:
+            return f"(offset {start} is past the end of the file; it has {total} lines)"
+        end = total if count is None else min(total, start + count)
+
+        out: list[str] = []
+        size = 0
+        i = start
+        while i < end:
+            # always emit at least one line so a huge single line can't stall paging
+            if out and size + len(lines[i]) > MAX_OUT - 200:
+                break
+            out.append(lines[i])
+            size += len(lines[i])
+            i += 1
+        text = "".join(out)
+        if text and not text.endswith("\n"):
+            text += "\n"
+        if i < end or end < total:
+            text += f"... [showing lines {start}-{i - 1} of {total}; call read_file with offset={i} to continue]"
+        elif start > 0:
+            text += f"... [showing lines {start}-{i - 1} of {total}; end of file]"
+        return text
 
     def write_file(self, path: str, content: str) -> str:
         p = self._path(path)
@@ -374,14 +829,15 @@ class Toolbox:
         return "\n".join(hits) or "No matches"
 
     def _validate_shell(self, command: str) -> str | None:
-        return shell_danger(command, self.root)
+        return shell_danger(command, self.root, downloaded=self.downloaded)
 
     def run_shell(self, command: str) -> str:
         reason = self._validate_shell(command)
         if reason:
             return f"Blocked: {reason}"
+        self.downloaded |= _download_outputs(command, self.root)
         proc = subprocess.Popen(
-            command, shell=True, cwd=self.root, stdin=subprocess.DEVNULL,
+            command, shell=True, cwd=self.root, env=_clean_env(), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
         try:
@@ -394,9 +850,14 @@ class Toolbox:
 
     def _build(self) -> list[Tool]:
         s = {"type": "string"}
+        n = {"type": "integer"}
         return [
             Tool("list_dir", "List files in a directory.", _params({"path": s}, []), self.list_dir),
-            Tool("read_file", "Read a text file.", _params({"path": s}, ["path"]), self.read_file),
+            Tool("read_file",
+                 "Read a text file. Optionally pass 'offset' (zero-based line number to start at) and "
+                 "'limit' (max lines) to read a slice; long files are cut off with a note giving the "
+                 "offset to continue from.",
+                 _params({"path": s, "offset": n, "limit": n}, ["path"]), self.read_file),
             Tool("search", "Find lines containing a literal string across files.",
                  _params({"pattern": s, "path": s}, ["pattern"]), self.search),
             Tool("write_file", "Create or overwrite a file.",
@@ -417,8 +878,69 @@ Use tools to inspect the project before changing it. Make small, focused edits
 with edit_file when possible. After changes, verify them (run tests or the code).
 Be concise. When the task is done, say what you changed."""
 
+# Emit kinds: assistant / tool / result / error go to the transcript;
+# "status" (what the agent is doing right now) and "hint" (a short note about
+# the current step) only feed the live activity panel in the TUI.
 Emit = Callable[[str, str], None]       # (kind, text)
 Approve = Callable[[str, dict], bool]   # (tool name, args) -> allowed?
+
+TOOL_LABELS = {
+    "list_dir": "Listing a directory",
+    "read_file": "Reading a file",
+    "search": "Searching the project",
+    "write_file": "Writing a file",
+    "edit_file": "Editing a file",
+    "run_shell": "Running a command",
+}
+
+
+def _one_line(text, limit: int = 100) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
+
+
+def tool_label(name: str) -> str:
+    return TOOL_LABELS.get(name, f"Using {name}")
+
+
+def describe_call(name: str, args) -> str:
+    """One-line, human-readable description of a tool call for the activity panel."""
+    a = args if isinstance(args, dict) else {}
+    if name == "list_dir":
+        text = f"Listing {a.get('path') or '.'}"
+    elif name == "read_file":
+        text = f"Reading {a.get('path') or '?'}"
+        if a.get("offset") not in (None, "", 0):
+            text += f" (from offset {a['offset']})"
+    elif name == "search":
+        text = f"Searching for '{a.get('pattern', '')}'"
+        if a.get("path"):
+            text += f" in {a['path']}"
+    elif name == "write_file":
+        text = f"Writing {a.get('path') or '?'}"
+    elif name == "edit_file":
+        text = f"Editing {a.get('path') or '?'}"
+    elif name == "run_shell":
+        text = f"Running: {a.get('command', '')}"
+    else:
+        text = f"Calling {name}"
+    return _one_line(text)
+
+
+def summarize_reasoning(text) -> str:
+    """First meaningful line of a reasoning model's thinking, as a short hint."""
+    if not isinstance(text, str):
+        return ""
+    for line in text.splitlines():
+        line = line.strip().strip("*#-> `").strip()
+        if line:
+            return _one_line(line, 110)
+    return ""
+
+
+def format_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s}s" if s < 60 else f"{s // 60}m {s % 60:02d}s"
 
 
 class Agent:
@@ -433,7 +955,11 @@ class Agent:
     def run(self, user_text: str, emit: Emit, approve: Approve) -> None:
         self.messages.append({"role": "user", "content": user_text})
         for _ in range(self.max_steps):
+            emit("status", "Thinking")
             msg = self.llm.chat(self.messages, self.toolbox.schemas())
+            hint = summarize_reasoning(msg.get("reasoning_content") or msg.get("reasoning"))
+            if hint:
+                emit("hint", hint)
             calls = msg.get("tool_calls") or []
             entry: dict = {"role": "assistant", "content": msg.get("content") or ""}
             if calls:
@@ -457,6 +983,7 @@ class Agent:
             result = "Error: arguments were not valid JSON"
         else:
             emit("tool", f"{name} {json.dumps(args)[:200]}")
+            emit("hint", describe_call(name, args))
             tool = self.toolbox.tools.get(name)
             reason = None
             if tool and tool.validate:
@@ -467,24 +994,71 @@ class Agent:
             if reason:
                 result = f"Blocked: {reason}. Don't retry this; pick a safer approach or ask the user."
                 emit("error", f"blocked {name}: {reason}")
-            elif tool and tool.dangerous and not approve(name, args):
-                result = "User denied this action."
-                emit("error", f"denied: {name}")
             else:
-                result = self.toolbox.execute(name, args)
-                emit("result", result[:400])
+                allowed = True
+                if tool and tool.dangerous:
+                    emit("status", "Waiting for your approval")
+                    allowed = approve(name, args)
+                if not allowed:
+                    result = "User denied this action."
+                    emit("error", f"denied: {name}")
+                else:
+                    emit("status", tool_label(name))
+                    result = self.toolbox.execute(name, args)
+                    emit("result", result[:400])
         self.messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
 
 
 # --------------------------------------------------------------------------
 # Textual TUI
 # --------------------------------------------------------------------------
+class WrapLog(RichLog):
+    """A RichLog that always wraps to its own width.
+
+    RichLog renders every write at max(content width, min_width) and min_width
+    defaults to 78, which forces horizontal scrolling in narrower terminals; we
+    set it to 1. RichLog also bakes line breaks in at write time, so we keep the
+    renderables and re-render them whenever the width changes (terminal resize,
+    scrollbar appearing) so older output re-wraps too.
+    """
+
+    def __init__(self, **kw):
+        kw.setdefault("wrap", True)
+        kw.setdefault("min_width", 1)
+        super().__init__(**kw)
+        self._history: list = []
+        self._width = 0
+        self._reflow_pending = False
+
+    def add(self, renderable) -> None:
+        self._history.append(renderable)
+        self.write(renderable)
+
+    def reset(self) -> None:
+        self._history.clear()
+        self.clear()
+
+    def on_resize(self, event) -> None:
+        width = event.size.width
+        if self._width and width and width != self._width and self._history and not self._reflow_pending:
+            self._reflow_pending = True
+            self.call_after_refresh(self._reflow)
+        if width:
+            self._width = width
+
+    def _reflow(self) -> None:
+        self._reflow_pending = False
+        self.clear()
+        for item in self._history:
+            self.write(item)
+
+
 class ApprovalScreen(ModalScreen[bool]):
     BINDINGS = [Binding("y", "allow", "Allow"), Binding("n,escape", "deny", "Deny")]
     DEFAULT_CSS = """
     ApprovalScreen { align: center middle; }
     #box { width: 80%; max-height: 80%; border: thick $warning; background: $surface; padding: 1 2; }
-    #detail { height: auto; max-height: 20; overflow-y: auto; margin-bottom: 1; }
+    #detail { width: 100%; height: auto; max-height: 20; overflow-x: hidden; overflow-y: auto; margin-bottom: 1; }
     #buttons { height: 3; align-horizontal: center; }
     """
 
@@ -510,10 +1084,88 @@ class ApprovalScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class ActivityPanel(Static):
+    """Live 'what is the agent doing' panel: spinner, current activity, elapsed
+    time, and a short list of hints about recent steps. Click it (or press
+    ctrl+t) to collapse/expand. Only visible while the agent is working."""
+
+    SPINNER = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+    MAX_HINTS = 6
+    DEFAULT_CSS = """
+    ActivityPanel { display: none; height: auto; max-height: 12; padding: 0 1; border-top: solid $primary-darken-2; }
+    """
+
+    def __init__(self, **kw):
+        super().__init__("", **kw)
+        self.label = "Thinking"
+        self.hints: list[str] = []
+        self.expanded = True
+        self._t0 = 0.0
+        self._spin = 0
+        self._ticker = None
+
+    def start(self) -> None:
+        self.label, self.hints = "Thinking", []
+        self._t0, self._spin = time.monotonic(), 0
+        if self._ticker is None:
+            self._ticker = self.set_interval(0.1, self._tick)
+        else:
+            self._ticker.resume()
+        self.display = True
+        self._redraw()
+
+    def stop(self) -> None:
+        if self._ticker is not None:
+            self._ticker.pause()
+        self.display = False
+
+    def set_label(self, label: str) -> None:
+        self.label = label
+        self._redraw()
+
+    def add_hint(self, hint: str) -> None:
+        if hint and (not self.hints or self.hints[-1] != hint):
+            self.hints.append(hint)
+        self._redraw()
+
+    def toggle(self) -> None:
+        self.expanded = not self.expanded
+        self._redraw()
+
+    def on_click(self) -> None:
+        self.toggle()
+
+    def _tick(self) -> None:
+        self._spin += 1
+        self._redraw()
+
+    def _redraw(self) -> None:
+        self.update(self.build_text())
+
+    def build_text(self) -> Text:
+        t = Text()
+        t.append(self.SPINNER[self._spin % len(self.SPINNER)] + " ", style="bold cyan")
+        t.append(self.label, style="bold")
+        t.append(f"  {format_elapsed(time.monotonic() - self._t0)}  ", style="dim")
+        t.append("\u25be" if self.expanded else "\u25b8", style="dim")
+        if self.expanded and self.hints:
+            shown = self.hints[-self.MAX_HINTS:]
+            older = len(self.hints) - len(shown)
+            if older:
+                t.append(f"\n  \u2026 {older} earlier step{'s' if older != 1 else ''}", style="dim")
+            for i, h in enumerate(shown):
+                t.append("\n  \u2022 " + h, style="dim" if i < len(shown) - 1 else "")
+        return t
+
+
 class AiApp(App):
     TITLE = "ai"
-    BINDINGS = [Binding("ctrl+q", "quit", "Quit"), Binding("ctrl+l", "clear", "New chat")]
-    CSS = "#log { height: 1fr; padding: 0 1; } #prompt { dock: bottom; }"
+    BINDINGS = [
+        Binding("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+l", "clear", "New chat"),
+        Binding("ctrl+t", "toggle_activity", "Activity"),
+    ]
+    CSS = "#log { height: 1fr; padding: 0 1; overflow-x: hidden; } #prompt { dock: bottom; }"
 
     def __init__(self, agent: Agent, initial_prompt: str | None = None):
         super().__init__()
@@ -523,7 +1175,8 @@ class AiApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield RichLog(id="log", wrap=True, markup=False, highlight=False)
+        yield WrapLog(id="log", markup=False, highlight=False)
+        yield ActivityPanel(id="activity")
         yield Input(placeholder="Ask ai to build something...  (/clear to reset)", id="prompt")
         yield Footer()
 
@@ -535,12 +1188,15 @@ class AiApp(App):
             self.submit(self.initial_prompt)
 
     def _write(self, renderable) -> None:
-        self.query_one(RichLog).write(renderable)
+        self.query_one(WrapLog).add(renderable)
 
     def action_clear(self) -> None:
         self.agent.reset()
-        self.query_one(RichLog).clear()
+        self.query_one(WrapLog).reset()
         self._write(Text("Conversation cleared.", style="dim"))
+
+    def action_toggle_activity(self) -> None:
+        self.query_one(ActivityPanel).toggle()
 
     def on_input_submitted(self, e: Input.Submitted) -> None:
         text = e.value.strip()
@@ -555,6 +1211,7 @@ class AiApp(App):
         self._write(Text(f"\n> {text}", style="bold cyan"))
         self.busy = True
         self.sub_title = "thinking..."
+        self.query_one(ActivityPanel).start()
         self.run_agent(text)
 
     # runs in a worker thread; UI updates go through call_from_thread
@@ -571,9 +1228,22 @@ class AiApp(App):
 
     def _done(self) -> None:
         self.busy = False
+        self.query_one(ActivityPanel).stop()
         self.sub_title = str(self.agent.toolbox.root)
 
+    def _set_status(self, label: str) -> None:
+        self.query_one(ActivityPanel).set_label(label)
+
+    def _add_hint(self, hint: str) -> None:
+        self.query_one(ActivityPanel).add_hint(hint)
+
     def _emit(self, kind: str, text: str) -> None:
+        if kind == "status":
+            self.call_from_thread(self._set_status, text)
+            return
+        if kind == "hint":
+            self.call_from_thread(self._add_hint, text)
+            return
         style = {"tool": "yellow", "result": "dim", "error": "bold red"}.get(kind, "")
         item = Markdown(text) if kind == "assistant" else Text(("  " if kind == "result" else "") + text, style=style)
         self.call_from_thread(self._write, item)
