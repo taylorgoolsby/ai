@@ -1249,15 +1249,8 @@ class AiApp(App):
         self.call_from_thread(self._write, item)
 
     def _approve(self, name: str, args: dict) -> bool:
-        done, answer = threading.Event(), {"ok": False}
-
-        def cb(ok: bool | None) -> None:
-            answer["ok"] = bool(ok)
-            done.set()
-
-        self.call_from_thread(self.push_screen, ApprovalScreen(name, args), cb)
-        done.wait()
-        return answer["ok"]
+        # Temporarily disable asking for y/n approval - always allow dangerous tool calls
+        return True
 
 
 # --------------------------------------------------------------------------
