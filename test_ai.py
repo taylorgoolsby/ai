@@ -10,7 +10,9 @@ or just one area:
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import re
 import sys
 import tempfile
@@ -451,29 +453,6 @@ class LMStudioTests(unittest.TestCase):
         self.assertIn("500", str(cm.exception))
         self.assertIn("boom", str(cm.exception))
 
-    def test_chat_returns_message_and_sends_tools(self) -> None:
-        llm, http = self.make(model="m")
-        http.request.return_value = self.ok({"choices": [{"message": {"role": "assistant", "content": "hi"}}]})
-        msg = llm.chat([{"role": "user", "content": "yo"}], tools=[{"type": "function"}])
-        self.assertEqual(msg["content"], "hi")
-        method, url = http.request.call_args.args[:2]
-        body = http.request.call_args.kwargs["json"]
-        self.assertEqual((method, url), ("POST", "http://localhost:1234/v1/chat/completions"))
-        self.assertEqual(body["model"], "m")
-        self.assertEqual(body["tools"], [{"type": "function"}])
-
-    def test_chat_omits_tools_when_none(self) -> None:
-        llm, http = self.make(model="m")
-        http.request.return_value = self.ok({"choices": [{"message": {"content": "x"}}]})
-        llm.chat([])
-        self.assertNotIn("tools", http.request.call_args.kwargs["json"])
-
-    def test_chat_unexpected_response(self) -> None:
-        llm, http = self.make(model="m")
-        http.request.return_value = self.ok({"nope": 1})
-        with self.assertRaises(ai.LLMError):
-            llm.chat([])
-
 
 # --------------------------------------------------------------------------
 # Agent loop (scripted fake model)
@@ -483,7 +462,7 @@ class FakeLLM:
         self.script = list(script)
         self.calls: list[list[dict]] = []
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, progress=None):
         self.calls.append([dict(m) for m in messages])
         return self.script.pop(0) if self.script else {"role": "assistant", "content": "done"}
 
@@ -767,9 +746,9 @@ class GatedLLM(FakeLLM):
         super().__init__(script)
         self.gate = gate
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, progress=None):
         self.gate.wait(5)
-        return super().chat(messages, tools)
+        return super().chat(messages, tools, progress)
 
 
 class TuiActivityTests(unittest.IsolatedAsyncioTestCase):
@@ -1444,7 +1423,7 @@ class TuiSupervisionTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(type(app), "is_running", new_callable=mock.PropertyMock, return_value=False):
             thread = threading.Thread(target=lambda: result.update(ok=app._approve("write_file", {})), daemon=True)
             thread.start()
-            thread.join(3)
+            await asyncio.get_running_loop().run_in_executor(None, thread.join, 3)  # don't block the event loop
             self.assertFalse(thread.is_alive(), "agent thread is stuck waiting for an answer that can never come")
         self.assertIs(result.get("ok"), False)
 
@@ -1462,6 +1441,495 @@ class TuiSupervisionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(app.screen, ai.ApprovalScreen)
             await pilot.press("n")
             await self.wait_idle(app, pilot)
+
+
+# --------------------------------------------------------------------------
+# Streaming replies
+# --------------------------------------------------------------------------
+import itertools  # noqa: E402
+
+
+def sse(*events, done: bool = True) -> bytes:
+    """Server-sent-events body from dicts (or raw strings)."""
+    out = ""
+    for e in events:
+        out += "data: " + (e if isinstance(e, str) else json.dumps(e)) + "\n\n"
+    if done:
+        out += "data: [DONE]\n\n"
+    return out.encode()
+
+
+def delta(finish=None, **d) -> dict:
+    return {"choices": [{"index": 0, "delta": d, "finish_reason": finish}]}
+
+
+def tc(index=0, *, id=None, name=None, args=None) -> dict:
+    """A streamed tool-call fragment (as a delta chunk)."""
+    fn = {}
+    if name is not None:
+        fn["name"] = name
+    if args is not None:
+        fn["arguments"] = args
+    call = {"function": fn}
+    if index is not None:
+        call["index"] = index
+    if id:
+        call["id"], call["type"] = id, "function"
+    return delta(tool_calls=[call])
+
+
+class StreamClientCase(unittest.TestCase):
+    def client(self, handler, **kw) -> "ai.LMStudio":
+        llm = ai.LMStudio(model="m", **kw)
+        llm.http = ai.httpx.Client(transport=ai.httpx.MockTransport(handler))
+        return llm
+
+    def serving(self, body: bytes, status: int = 200, ctype: str = "text/event-stream", **kw):
+        seen: dict = {}
+
+        def handler(request):
+            seen["request"] = request
+            return ai.httpx.Response(status, headers={"content-type": ctype}, content=body)
+
+        return self.client(handler, **kw), seen
+
+
+class LMStudioStreamTests(StreamClientCase):
+    def test_request_asks_for_a_stream_and_carries_everything(self) -> None:
+        llm, seen = self.serving(sse(delta(content="hi")))
+        llm.chat([{"role": "user", "content": "yo"}], tools=[{"type": "function"}])
+        req = seen["request"]
+        body = json.loads(req.content)
+        self.assertEqual((req.method, str(req.url)), ("POST", "http://localhost:1234/v1/chat/completions"))
+        self.assertIs(body["stream"], True)
+        self.assertEqual(body["model"], "m")
+        self.assertEqual(body["messages"], [{"role": "user", "content": "yo"}])
+        self.assertEqual(body["tools"], [{"type": "function"}])
+
+    def test_tools_omitted_when_none(self) -> None:
+        llm, seen = self.serving(sse(delta(content="x")))
+        llm.chat([])
+        self.assertNotIn("tools", json.loads(seen["request"].content))
+
+    def test_content_deltas_are_joined(self) -> None:
+        llm, _ = self.serving(sse(delta(role="assistant", content=""), delta(content="Hel"), delta(content="lo "),
+                                  delta(content="world"), delta(finish="stop")))
+        msg = llm.chat([])
+        self.assertEqual(msg["content"], "Hello world")
+        self.assertEqual(msg["role"], "assistant")
+        self.assertEqual(msg["finish_reason"], "stop")
+        self.assertNotIn("tool_calls", msg)
+        self.assertNotIn("reasoning_content", msg)
+
+    def test_reasoning_is_collected_separately(self) -> None:
+        llm, _ = self.serving(sse(delta(reasoning_content="Let me "), delta(reasoning="think."),
+                                  delta(content="Answer")))
+        msg = llm.chat([])
+        self.assertEqual(msg["reasoning_content"], "Let me think.")
+        self.assertEqual(msg["content"], "Answer")
+
+    def test_tool_call_arguments_streamed_in_pieces(self) -> None:
+        llm, _ = self.serving(sse(
+            tc(0, id="abc", name="write_file", args='{"path": "a.t'),
+            tc(0, args='xt", "content": '),
+            tc(0, args='"hi"}'),
+            delta(finish="tool_calls")))
+        msg = llm.chat([])
+        self.assertEqual(msg["content"], "")
+        (call,) = msg["tool_calls"]
+        self.assertEqual((call["id"], call["type"], call["function"]["name"]), ("abc", "function", "write_file"))
+        self.assertEqual(json.loads(call["function"]["arguments"]), {"path": "a.txt", "content": "hi"})
+
+    def test_several_tool_calls_come_back_in_index_order(self) -> None:
+        llm, _ = self.serving(sse(
+            tc(0, id="a", name="read_file", args='{"path"'),
+            tc(1, id="b", name="list_dir", args="{"),
+            tc(0, args=': "x"}'),
+            tc(1, args="}")))
+        calls = llm.chat([])["tool_calls"]
+        self.assertEqual([(c["id"], c["function"]["name"], c["function"]["arguments"]) for c in calls],
+                         [("a", "read_file", '{"path": "x"}'), ("b", "list_dir", "{}")])
+
+    def test_tool_name_repeated_in_every_chunk_is_not_doubled(self) -> None:
+        llm, _ = self.serving(sse(tc(0, id="a", name="list_dir", args="{"), tc(0, name="list_dir", args="}")))
+        self.assertEqual(llm.chat([])["tool_calls"][0]["function"]["name"], "list_dir")
+
+    def test_tool_name_split_across_chunks_is_joined(self) -> None:
+        llm, _ = self.serving(sse(tc(0, id="a", name="read_"), tc(0, name="file", args="{}")))
+        self.assertEqual(llm.chat([])["tool_calls"][0]["function"]["name"], "read_file")
+
+    def test_missing_id_and_arguments_get_defaults(self) -> None:
+        llm, _ = self.serving(sse(tc(0, name="list_dir"), tc(1, name="list_dir")))
+        calls = llm.chat([])["tool_calls"]
+        self.assertEqual([c["id"] for c in calls], ["call_0", "call_1"])
+        self.assertEqual([c["function"]["arguments"] for c in calls], ["{}", "{}"])
+
+    def test_arguments_sent_as_an_object_become_json(self) -> None:
+        llm, _ = self.serving(sse(tc(0, id="a", name="read_file", args={"path": "x"})))
+        self.assertEqual(llm.chat([])["tool_calls"][0]["function"]["arguments"], '{"path": "x"}')
+
+    def test_servers_that_omit_the_index(self) -> None:
+        llm, _ = self.serving(sse(
+            tc(None, id="a", name="read_file", args='{"path":'),
+            tc(None, args=' "x"}'),                      # continuation of the same call
+            tc(None, id="a", args=""),                   # same id repeated: still the same call
+            tc(None, id="b", name="list_dir", args="{}")))  # new id: a new call
+        calls = llm.chat([])["tool_calls"]
+        self.assertEqual([(c["id"], c["function"]["name"], c["function"]["arguments"]) for c in calls],
+                         [("a", "read_file", '{"path": "x"}'), ("b", "list_dir", "{}")])
+
+    def test_text_and_tool_call_in_one_reply(self) -> None:
+        llm, _ = self.serving(sse(delta(content="Let me look."), tc(0, id="a", name="list_dir", args="{}")))
+        msg = llm.chat([])
+        self.assertEqual(msg["content"], "Let me look.")
+        self.assertEqual(len(msg["tool_calls"]), 1)
+
+    def test_keepalives_comments_and_junk_lines_are_ignored(self) -> None:
+        body = (b": keep-alive\n\nevent: ping\n\ndata: not json\n\ndata: [1, 2]\n\n"
+                b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n\n\ndata: [DONE]\n\n')
+        llm, _ = self.serving(body)
+        self.assertEqual(llm.chat([])["content"], "hi")
+
+    def test_nothing_after_done_is_read(self) -> None:
+        llm, _ = self.serving(sse(delta(content="a"), "[DONE]", delta(content="IGNORED"), done=False))
+        self.assertEqual(llm.chat([])["content"], "a")
+
+    def test_stream_without_done_marker_is_accepted(self) -> None:
+        llm, _ = self.serving(sse(delta(content="a"), delta(content="b"), done=False))
+        self.assertEqual(llm.chat([])["content"], "ab")
+
+    def test_message_key_is_used_when_a_chunk_has_no_delta(self) -> None:
+        llm, _ = self.serving(sse({"choices": [{"message": {"content": "whole"}}]}))
+        self.assertEqual(llm.chat([])["content"], "whole")
+
+    def test_truncated_reply_is_flagged(self) -> None:
+        llm, _ = self.serving(sse(tc(0, id="a", name="write_file", args='{"path": "a.txt", "cont'),
+                                  delta(finish="length")))
+        self.assertEqual(llm.chat([])["finish_reason"], "length")
+
+    def test_empty_stream_is_an_error(self) -> None:
+        llm, _ = self.serving(sse())
+        with self.assertRaises(ai.LLMError) as cm:
+            llm.chat([])
+        self.assertIn("empty", str(cm.exception))
+
+    def test_error_event_in_the_stream(self) -> None:
+        llm, _ = self.serving(sse(delta(content="a"), {"error": {"message": "context length exceeded"}}))
+        with self.assertRaises(ai.LLMError) as cm:
+            llm.chat([])
+        self.assertIn("context length exceeded", str(cm.exception))
+
+    def test_http_error_status_includes_the_body(self) -> None:
+        llm, _ = self.serving(b"model crashed", status=500, ctype="text/plain")
+        with self.assertRaises(ai.LLMError) as cm:
+            llm.chat([])
+        self.assertIn("500", str(cm.exception))
+        self.assertIn("model crashed", str(cm.exception))
+
+    def test_connection_refused(self) -> None:
+        def handler(request):
+            raise ai.httpx.ConnectError("refused")
+
+        with self.assertRaises(ai.LLMError) as cm:
+            self.client(handler).chat([])
+        self.assertIn("Can't reach LM Studio", str(cm.exception))
+
+    def test_silence_timeout_message_is_actionable(self) -> None:
+        def handler(request):
+            raise ai.httpx.ReadTimeout("timed out")
+
+        with self.assertRaises(ai.LLMError) as cm:
+            self.client(handler, timeout=42).chat([])
+        msg = str(cm.exception)
+        self.assertNotEqual(msg, "timed out")
+        self.assertIn("no data for 42s", msg)
+        self.assertIn("--timeout", msg)
+
+    def test_connection_dropped_mid_stream(self) -> None:
+        def chunks():
+            yield sse(delta(content="partial"), done=False)
+            raise ai.httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+        llm = self.client(lambda req: ai.httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                                         content=chunks()))
+        with self.assertRaises(ai.LLMError) as cm:
+            llm.chat([])
+        self.assertIn("peer closed", str(cm.exception))
+
+    def test_server_that_ignores_stream_true_still_works(self) -> None:
+        body = json.dumps({"choices": [{"message": {"role": "assistant", "content": "plain"}}]}).encode()
+        llm, _ = self.serving(body, ctype="application/json")
+        self.assertEqual(llm.chat([])["content"], "plain")
+
+    def test_unexpected_json_reply(self) -> None:
+        for body in (b'{"nope": 1}', b"not json at all", b"[]"):
+            with self.subTest(body=body):
+                llm, _ = self.serving(body, ctype="application/json")
+                with self.assertRaises(ai.LLMError):
+                    llm.chat([])
+
+    def test_reply_is_processed_as_it_arrives_not_after_it_ends(self) -> None:
+        seen_before_second_chunk: list[int] = []
+        reports: list[tuple[str, str]] = []
+
+        def chunks():
+            yield sse(delta(content="first"), done=False)
+            seen_before_second_chunk.append(len(reports))
+            yield sse(delta(content=" second"), done=True)
+
+        llm = self.client(lambda req: ai.httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                                         content=chunks()))
+        msg = llm.chat([], progress=lambda label, detail: reports.append((label, detail)))
+        self.assertEqual(seen_before_second_chunk, [1])  # progress for chunk 1 fired before chunk 2 existed
+        self.assertEqual(msg["content"], "first second")
+
+    def test_timeout_is_the_silence_limit_and_is_configurable(self) -> None:
+        default = ai.LMStudio()
+        self.assertEqual(default.timeout, 600.0)
+        self.assertEqual(default.http.timeout.read, 600.0)
+        self.assertEqual(default.http.timeout.connect, 5.0)
+        custom = ai.LMStudio(timeout=90)
+        self.assertEqual((custom.timeout, custom.http.timeout.read), (90, 90))
+
+    def test_list_models_timeout_uses_the_same_message(self) -> None:
+        def handler(request):
+            raise ai.httpx.ReadTimeout("timed out")
+
+        with self.assertRaises(ai.LLMError) as cm:
+            self.client(handler, timeout=7).list_models()
+        self.assertIn("no data for 7s", str(cm.exception))
+
+
+class StreamProgressTests(unittest.TestCase):
+    """Progress callbacks, driven straight through the SSE assembler with a fake clock."""
+
+    def run_lines(self, events, step: float = 1.0):
+        lines = [l for e in events for l in ("data: " + json.dumps(e), "")]
+        reports: list[tuple[str, str]] = []
+        with mock.patch.object(ai.time, "monotonic", side_effect=itertools.count(0, step)):
+            msg = ai.LMStudio._consume(iter(lines), lambda label, detail: reports.append((label, detail)))
+        return msg, reports
+
+    def test_labels_and_details_follow_the_stream(self) -> None:
+        _, reports = self.run_lines([
+            delta(reasoning_content="abc"), delta(reasoning_content="de"),
+            delta(content="hi"),
+            tc(0, id="x", name="write_file", args='{"path": "src/a.tsx", "con'),
+            tc(0, args='tent": "hello'),
+        ])
+        self.assertEqual(reports[:3], [("Reasoning", "3 chars"), ("Reasoning", "5 chars"),
+                                       ("Writing a reply", "2 chars")])
+        tool = reports[3:]
+        self.assertEqual({label for label, _ in tool}, {"Composing write_file"})
+        self.assertTrue(all(d.startswith("src/a.tsx \u00b7 ") for _, d in tool))
+        self.assertTrue(tool[-1][1].endswith("chars"))
+        # the size keeps growing as arguments stream in
+        sizes = [int(d.rsplit(" \u00b7 ", 1)[1].split()[0].replace(",", "")) for _, d in tool]
+        self.assertEqual(sizes, sorted(sizes))
+        self.assertGreater(sizes[-1], sizes[0])
+
+    def test_unnamed_tool_call_label(self) -> None:
+        _, reports = self.run_lines([tc(0, id="x", args='{"pa')])
+        self.assertEqual(reports[0][0], "Composing a tool call")
+
+    def test_updates_are_throttled_but_label_changes_always_get_through(self) -> None:
+        events = [delta(content="x")] * 300           # 300 chunks over 3 (fake) seconds
+        _, reports = self.run_lines(events, step=0.01)
+        self.assertGreaterEqual(len(reports), 5)
+        self.assertLessEqual(len(reports), 25)
+        self.assertEqual(reports[0], ("Writing a reply", "1 chars"))
+
+        _, reports = self.run_lines([delta(reasoning_content="think"), delta(content="answer")], step=0.0001)
+        self.assertEqual([label for label, _ in reports], ["Reasoning", "Writing a reply"])
+
+    def test_no_callback_is_fine(self) -> None:
+        msg = ai.LMStudio._consume(iter(["data: " + json.dumps(delta(content="ok")), ""]), None)
+        self.assertEqual(msg["content"], "ok")
+
+
+class StreamDetailTests(unittest.TestCase):
+    def test_path_command_and_pattern_targets(self) -> None:
+        a = '{"path": "src/app/page.tsx", "content": "abc'
+        self.assertEqual(ai._stream_detail("write_file", a), f"src/app/page.tsx \u00b7 {len(a)} chars")
+        c = '{"command": "echo hi'
+        self.assertEqual(ai._stream_detail("run_shell", c), f"echo hi \u00b7 {len(c)} chars")
+        p = '{"pattern": "TODO", "path": "src"}'
+        self.assertEqual(ai._stream_detail("search", p), f"TODO \u00b7 {len(p)} chars")
+
+    def test_no_target_yet(self) -> None:
+        self.assertEqual(ai._stream_detail("x", ""), "0 chars")
+        self.assertEqual(ai._stream_detail("x", '{"fo'), "4 chars")
+        self.assertEqual(ai._stream_detail("write_file", '{"pa'), "4 chars")
+
+    def test_thousands_separator(self) -> None:
+        self.assertTrue(ai._stream_detail("x", "a" * 12345).endswith("12,345 chars"))
+
+    def test_escapes_are_decoded_and_long_targets_clipped(self) -> None:
+        self.assertTrue(ai._stream_detail("run_shell", r'{"command": "echo \"hi\"').startswith('echo "hi" '))
+        detail = ai._stream_detail("run_shell", '{"command": "' + "x" * 300)
+        self.assertLessEqual(len(detail.split(" \u00b7 ")[0]), 60)
+        self.assertNotIn("\n", ai._stream_detail("run_shell", '{"command": "a\\nb'))
+
+    def test_half_written_escape_does_not_crash(self) -> None:
+        self.assertIn("chars", ai._stream_detail("run_shell", '{"command": "echo \\'))
+
+
+class AgentStreamingTests(AgentHarness):
+    class ProgressLLM(FakeLLM):
+        def __init__(self, script, steps):
+            super().__init__(script)
+            self.steps = steps
+
+        def chat(self, messages, tools=None, progress=None):
+            if progress and len(self.calls) == 0:
+                for label, detail in self.steps:
+                    progress(label, detail)
+            return super().chat(messages, tools, progress)
+
+    def run_with(self, llm):
+        events: list[tuple[str, str]] = []
+        agent = ai.Agent(llm, self.tb)
+        agent.run("go", lambda k, t: events.append((k, t)), lambda n, a: True)
+        return agent, events
+
+    def test_progress_becomes_status_and_progress_events(self) -> None:
+        llm = self.ProgressLLM(
+            [{"tool_calls": [tool_call("write_file", {"path": "a.txt", "content": "hi"})]}, {"content": "done"}],
+            [("Reasoning", "10 chars"), ("Reasoning", "20 chars"), ("Composing write_file", "a.txt \u00b7 30 chars")])
+        _, events = self.run_with(llm)
+        self.assertEqual([t for k, t in events if k == "status"],
+                         ["Thinking", "Reasoning", "Composing write_file", "Writing a file", "Thinking"])
+        self.assertEqual([t for k, t in events if k == "progress"],
+                         ["10 chars", "20 chars", "a.txt \u00b7 30 chars"])
+        self.assertEqual((self.root / "a.txt").read_text(), "hi")
+
+    def test_progress_for_the_thinking_label_does_not_repeat_the_status(self) -> None:
+        llm = self.ProgressLLM([{"content": "ok"}], [("Thinking", "1 chars")])
+        _, events = self.run_with(llm)
+        self.assertEqual([t for k, t in events if k == "status"], ["Thinking"])
+
+    def test_truncated_reply_is_reported(self) -> None:
+        _, events = self.run_with(FakeLLM([{"content": "cut off", "finish_reason": "length"}]))
+        errors = [t for k, t in events if k == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("token limit", errors[0])
+
+    def test_truncated_tool_call_is_handed_back_to_the_model_as_a_json_error(self) -> None:
+        agent, events = self.run_with(FakeLLM([
+            {"tool_calls": [tool_call("write_file", '{"path": "a.txt", "cont')], "finish_reason": "length"},
+            {"content": "retrying"},
+        ]))
+        tool_msg = next(m for m in agent.messages if m["role"] == "tool")
+        self.assertIn("not valid JSON", tool_msg["content"])
+        self.assertFalse((self.root / "a.txt").exists())
+
+    def test_end_to_end_with_a_real_streaming_client(self) -> None:
+        (self.root / "a.txt").write_text("file contents")
+        bodies = iter([
+            sse(delta(reasoning_content="Need to read it."),
+                tc(0, id="call_9", name="read_file", args='{"pa'), tc(0, args='th": "a.txt"}'), delta(finish="tool_calls")),
+            sse(delta(content="It says "), delta(content="file contents."), delta(finish="stop")),
+        ])
+        requests: list[dict] = []
+
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return ai.httpx.Response(200, headers={"content-type": "text/event-stream"}, content=next(bodies))
+
+        llm = ai.LMStudio(model="m")
+        llm.http = ai.httpx.Client(transport=ai.httpx.MockTransport(handler))
+        events: list[tuple[str, str]] = []
+        agent = ai.Agent(llm, self.tb)
+        agent.run("what is in a.txt?", lambda k, t: events.append((k, t)), lambda n, a: True)
+
+        self.assertEqual([t for k, t in events if k == "assistant"], ["It says file contents."])
+        tool_msg = next(m for m in agent.messages if m["role"] == "tool")
+        self.assertEqual((tool_msg["tool_call_id"], tool_msg["content"]), ("call_9", "file contents"))
+        # the second request replays the streamed tool call, without our private extras
+        assistant = requests[1]["messages"][2]
+        self.assertEqual(assistant["tool_calls"][0]["id"], "call_9")
+        self.assertEqual(assistant["tool_calls"][0]["function"]["name"], "read_file")
+        for extra in ("reasoning_content", "reasoning", "finish_reason"):
+            self.assertNotIn(extra, assistant)
+        self.assertIn("Need to read it.", [t for k, t in events if k == "hint"])
+        self.assertTrue(all(r["stream"] is True for r in requests))
+
+
+class TuiStreamingTests(unittest.IsolatedAsyncioTestCase):
+    class StreamingGatedLLM(GatedLLM):
+        def chat(self, messages, tools=None, progress=None):
+            if progress:
+                progress("Composing write_file", "src/a.tsx \u00b7 1,234 chars")
+            return super().chat(messages, tools, progress)
+
+    def make_app(self, script, gate):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        llm = self.StreamingGatedLLM(script, gate)
+        return ai.AiApp(ai.Agent(llm, ai.Toolbox(Path(tmp.name))))
+
+    async def test_panel_shows_live_progress_while_the_model_is_generating(self) -> None:
+        gate = threading.Event()
+        app = self.make_app([{"content": "done"}], gate)
+        async with app.run_test() as pilot:
+            panel = app.query_one(ai.ActivityPanel)
+            app.query_one(ai.Input).value = "go"
+            await pilot.press("enter")
+            for _ in range(100):
+                await pilot.pause(0.05)
+                if panel.detail:
+                    break
+            self.assertEqual(panel.label, "Composing write_file")
+            self.assertEqual(panel.detail, "src/a.tsx \u00b7 1,234 chars")
+            header = panel.build_text().plain
+            self.assertIn("Composing write_file", header)
+            self.assertIn("src/a.tsx \u00b7 1,234 chars", header)
+
+            gate.set()
+            for _ in range(100):
+                await pilot.pause(0.05)
+                if not app.busy:
+                    break
+            self.assertFalse(app.busy)
+            self.assertFalse(panel.display)
+            log_text = "\n".join(strip.text for strip in app.query_one(ai.WrapLog).lines)
+            self.assertNotIn("1,234 chars", log_text)  # progress is live-only, not transcript noise
+
+    async def test_new_status_clears_the_previous_detail(self) -> None:
+        app = self.make_app([], threading.Event())
+        async with app.run_test() as pilot:
+            panel = app.query_one(ai.ActivityPanel)
+            panel.start()
+            panel.set_detail("a.txt \u00b7 5 chars")
+            panel.set_label("Writing a file")
+            self.assertEqual(panel.detail, "")
+            panel.start()
+            panel.set_detail("x")
+            panel.start()
+            self.assertEqual(panel.detail, "")
+
+
+class MainTimeoutOptionTests(unittest.TestCase):
+    def run_main(self, argv, env=None):
+        with mock.patch.object(sys, "argv", ["ai"] + argv), \
+                mock.patch.dict("os.environ", env or {}, clear=False), \
+                mock.patch.object(ai, "_reattach_tty"), \
+                mock.patch.object(ai, "AiApp"), \
+                mock.patch.object(ai, "Agent") as agent_cls:
+            ai.main()
+        return agent_cls.call_args.args[0]  # the LMStudio instance
+
+    def test_default(self) -> None:
+        with mock.patch.dict("os.environ"):
+            os.environ.pop("AI_TIMEOUT", None)
+            self.assertEqual(self.run_main([]).timeout, 600.0)
+
+    def test_flag(self) -> None:
+        self.assertEqual(self.run_main(["--timeout", "7.5"]).timeout, 7.5)
+
+    def test_environment_variable_and_flag_precedence(self) -> None:
+        self.assertEqual(self.run_main([], {"AI_TIMEOUT": "90"}).timeout, 90.0)
+        self.assertEqual(self.run_main(["--timeout", "5"], {"AI_TIMEOUT": "90"}).timeout, 5.0)
 
 
 if __name__ == "__main__":

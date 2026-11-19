@@ -68,27 +68,59 @@ class LLMError(Exception):
     pass
 
 
+DEFAULT_TIMEOUT = 600.0
+
+
+def _stream_detail(name: str, args_text: str) -> str:
+    """Live detail for a tool call still being generated: its target and how much has been written."""
+    m = re.search(r'"(?:path|command|pattern)"\s*:\s*"((?:[^"\\]|\\.)*)', args_text)
+    target = ""
+    if m:
+        target = m.group(1)
+        try:
+            target = json.loads('"' + target + '"')  # un-escape; may fail on a half-written escape
+        except ValueError:
+            pass
+        target = _one_line(target, 60)
+    size = f"{len(args_text):,} chars"
+    return f"{target} \u00b7 {size}" if target else size
+
+
 class LMStudio:
-    def __init__(self, base_url: str = "http://localhost:1234/v1", model: str | None = None):
+    def __init__(self, base_url: str = "http://localhost:1234/v1", model: str | None = None,
+                 timeout: float = DEFAULT_TIMEOUT):
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.http = httpx.Client(timeout=httpx.Timeout(600.0, connect=5.0))
+        self.timeout = timeout
+        # Replies are streamed, so `timeout` is the longest we wait for *any* data, not for the whole
+        # reply: a slow model that keeps producing tokens never trips it. It only fires if the server
+        # goes completely silent (e.g. while ingesting a huge prompt before the first token).
+        self.http = httpx.Client(timeout=httpx.Timeout(timeout, connect=5.0))
+
+    def _translate(self, e: httpx.HTTPError) -> LLMError:
+        if isinstance(e, httpx.ConnectError):
+            return LLMError(
+                f"Can't reach LM Studio at {self.base_url}. "
+                "Load a model and start the server (Developer tab -> Start Server, "
+                "or `lms server start`)."
+            )
+        if isinstance(e, httpx.ReadTimeout):
+            return LLMError(
+                f"LM Studio sent no data for {self.timeout:g}s. It may still be processing a very long prompt "
+                "or be stuck; raise --timeout (or AI_TIMEOUT), shrink the conversation with /clear, "
+                "or use a faster model."
+            )
+        if isinstance(e, httpx.HTTPStatusError):
+            return LLMError(f"LM Studio returned {e.response.status_code}: {e.response.text[:500]}")
+        return LLMError(str(e) or type(e).__name__)
 
     def _request(self, method: str, path: str, **kw) -> dict:
         try:
             r = self.http.request(method, self.base_url + path, **kw)
             r.raise_for_status()
             return r.json()
-        except httpx.ConnectError:
-            raise LLMError(
-                f"Can't reach LM Studio at {self.base_url}. "
-                "Load a model and start the server (Developer tab -> Start Server, "
-                "or `lms server start`)."
-            )
-        except httpx.HTTPStatusError as e:
-            raise LLMError(f"LM Studio returned {e.response.status_code}: {e.response.text[:500]}")
         except httpx.HTTPError as e:
-            raise LLMError(str(e))
+            raise self._translate(e)
 
     def list_models(self) -> list[str]:
         return [m["id"] for m in self._request("GET", "/models").get("data", [])]
@@ -101,15 +133,123 @@ class LMStudio:
             self.model = models[0]
         return self.model
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
-        body = {"model": self.ensure_model(), "messages": messages, "temperature": 0.2}
+    def chat(self, messages: list[dict], tools: list[dict] | None = None,
+             progress: Callable[[str, str], None] | None = None) -> dict:
+        """Send the whole conversation and stream the reply. Returns the assistant message
+        ({"content", optional "tool_calls", "reasoning_content", "finish_reason"}).
+        `progress(label, detail)` is called (throttled) while the reply is being generated."""
+        body = {"model": self.ensure_model(), "messages": messages, "temperature": 0.2, "stream": True}
         if tools:
             body["tools"] = tools
-        data = self._request("POST", "/chat/completions", json=body)
         try:
-            return data["choices"][0]["message"]
-        except (KeyError, IndexError):
-            raise LLMError(f"Unexpected response: {str(data)[:500]}")
+            with self.http.stream("POST", self.base_url + "/chat/completions", json=body) as r:
+                if r.status_code >= 400:
+                    r.read()
+                    raise LLMError(f"LM Studio returned {r.status_code}: {r.text[:500]}")
+                ctype = r.headers.get("content-type", "")
+                if "json" in ctype and "event-stream" not in ctype:  # server ignored stream=true
+                    r.read()
+                    try:
+                        data = r.json()
+                    except ValueError:
+                        raise LLMError(f"Unexpected response: {r.text[:500]}")
+                    try:
+                        return data["choices"][0]["message"]
+                    except (KeyError, IndexError, TypeError):
+                        raise LLMError(f"Unexpected response: {str(data)[:500]}")
+                return self._consume(r.iter_lines(), progress)
+        except httpx.HTTPError as e:
+            raise self._translate(e)
+
+    @staticmethod
+    def _consume(lines, progress) -> dict:
+        """Assemble a message from server-sent-event lines (OpenAI streaming format)."""
+        content: list[str] = []
+        reasoning: list[str] = []
+        calls: dict[int, dict] = {}
+        finish = None
+        state = {"label": "", "t": 0.0}
+
+        def report(label: str, detail: str) -> None:
+            if not progress:
+                return
+            now = time.monotonic()
+            if label != state["label"] or now - state["t"] >= 0.15:  # label changes always get through
+                state["label"], state["t"] = label, now
+                progress(label, detail)
+
+        last_idx = -1
+        n_content = n_reasoning = 0
+        for raw in lines:
+            line = raw.strip()
+            if not line.startswith("data:"):
+                continue  # blank lines, ": keep-alive" comments, event:/id: fields
+            line = line[5:].strip()
+            if line == "[DONE]":
+                break
+            try:
+                chunk = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("error"):
+                raise LLMError(f"LM Studio error: {str(chunk['error'])[:500]}")
+            for choice in chunk.get("choices") or []:
+                delta = choice["delta"] if "delta" in choice else (choice.get("message") or {})
+                finish = choice.get("finish_reason") or finish
+
+                r_text = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(r_text, str) and r_text:
+                    reasoning.append(r_text)
+                    n_reasoning += len(r_text)
+                    report("Reasoning", f"{n_reasoning:,} chars")
+
+                c_text = delta.get("content")
+                if isinstance(c_text, str) and c_text:
+                    content.append(c_text)
+                    n_content += len(c_text)
+                    report("Writing a reply", f"{n_content:,} chars")
+
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index")
+                    if idx is None:  # no index: a *different* id starts a new call, otherwise continue the last one
+                        prev = calls.get(last_idx)
+                        new_call = prev is None or bool(tc.get("id") and prev["id"] and tc["id"] != prev["id"])
+                        idx = last_idx + 1 if new_call else last_idx
+                    last_idx = idx
+                    entry = calls.setdefault(idx, {"id": "", "name": "", "args": ""})
+                    if tc.get("id"):
+                        entry["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    name = fn.get("name")
+                    if name:  # some servers send the name once, some in pieces, some repeat it in every chunk
+                        if not entry["name"]:
+                            entry["name"] = name
+                        elif name != entry["name"] and not entry["name"].endswith(name):
+                            entry["name"] += name
+                    args = fn.get("arguments")
+                    if isinstance(args, dict):
+                        args = json.dumps(args)
+                    if isinstance(args, str):
+                        entry["args"] += args
+                    label = f"Composing {entry['name']}" if entry["name"] else "Composing a tool call"
+                    report(label, _stream_detail(entry["name"], entry["args"]))
+
+        msg: dict = {"role": "assistant", "content": "".join(content)}
+        if reasoning:
+            msg["reasoning_content"] = "".join(reasoning)
+        if calls:
+            msg["tool_calls"] = [
+                {"id": c["id"] or f"call_{i}", "type": "function",
+                 "function": {"name": c["name"], "arguments": c["args"] or "{}"}}
+                for i, c in sorted(calls.items())
+            ]
+        if finish:
+            msg["finish_reason"] = finish
+        if not (content or reasoning or calls):
+            raise LLMError("LM Studio returned an empty reply.")
+        return msg
 
 
 # --------------------------------------------------------------------------
@@ -894,8 +1034,9 @@ with edit_file when possible. After changes, verify them (run tests or the code)
 Be concise. When the task is done, say what you changed."""
 
 # Emit kinds: assistant / tool / result / error go to the transcript;
-# "status" (what the agent is doing right now) and "hint" (a short note about
-# the current step) only feed the live activity panel in the TUI.
+# "status" (what the agent is doing right now), "progress" (live detail while the
+# model is generating, e.g. "bots/page.tsx \u00b7 14,203 chars") and "hint" (a short
+# note about the current step) only feed the live activity panel in the TUI.
 Emit = Callable[[str, str], None]       # (kind, text)
 Approve = Callable[[str, dict], bool]   # (tool name, args) -> allowed?
 
@@ -980,7 +1121,18 @@ class Agent:
                 return
             steps += 1
             emit("status", "Thinking")
-            msg = self.llm.chat(self.messages, self.toolbox.schemas())
+            shown = {"label": "Thinking"}
+
+            def progress(label: str, detail: str) -> None:
+                if label != shown["label"]:
+                    shown["label"] = label
+                    emit("status", label)
+                emit("progress", detail)
+
+            msg = self.llm.chat(self.messages, self.toolbox.schemas(), progress=progress)
+            if msg.get("finish_reason") == "length":
+                emit("error", "The reply hit the model's token limit and was cut off; "
+                              "raise the context/max tokens in LM Studio.")
             hint = summarize_reasoning(msg.get("reasoning_content") or msg.get("reasoning"))
             if hint:
                 emit("hint", hint)
@@ -1120,6 +1272,7 @@ class ActivityPanel(Static):
     def __init__(self, **kw):
         super().__init__("", **kw)
         self.label = "Thinking"
+        self.detail = ""  # live progress while the model generates, e.g. "page.tsx \u00b7 14,203 chars"
         self.hints: list[str] = []
         self.expanded = True
         self.supervised = True
@@ -1128,7 +1281,7 @@ class ActivityPanel(Static):
         self._ticker = None
 
     def start(self) -> None:
-        self.label, self.hints = "Thinking", []
+        self.label, self.detail, self.hints = "Thinking", "", []
         self._t0, self._spin = time.monotonic(), 0
         if self._ticker is None:
             self._ticker = self.set_interval(0.1, self._tick)
@@ -1143,7 +1296,11 @@ class ActivityPanel(Static):
         self.display = False
 
     def set_label(self, label: str) -> None:
-        self.label = label
+        self.label, self.detail = label, ""
+        self._redraw()
+
+    def set_detail(self, detail: str) -> None:
+        self.detail = detail
         self._redraw()
 
     def add_hint(self, hint: str) -> None:
@@ -1173,6 +1330,8 @@ class ActivityPanel(Static):
         t = Text()
         t.append(self.SPINNER[self._spin % len(self.SPINNER)] + " ", style="bold cyan")
         t.append(self.label, style="bold")
+        if self.detail:
+            t.append("  " + self.detail, style="cyan")
         t.append(f"  {format_elapsed(time.monotonic() - self._t0)}  ", style="dim")
         t.append("\u25be" if self.expanded else "\u25b8", style="dim")
         if not self.supervised:
@@ -1293,12 +1452,18 @@ class AiApp(App):
     def _add_hint(self, hint: str) -> None:
         self.query_one(ActivityPanel).add_hint(hint)
 
+    def _set_detail(self, detail: str) -> None:
+        self.query_one(ActivityPanel).set_detail(detail)
+
     def _emit(self, kind: str, text: str) -> None:
         if kind == "status":
             self.call_from_thread(self._set_status, text)
             return
         if kind == "hint":
             self.call_from_thread(self._add_hint, text)
+            return
+        if kind == "progress":
+            self.call_from_thread(self._set_detail, text)
             return
         style = {"tool": "yellow", "result": "dim", "error": "bold red"}.get(kind, "")
         item = Markdown(text) if kind == "assistant" else Text(("  " if kind == "result" else "") + text, style=style)
@@ -1343,10 +1508,13 @@ def main() -> None:
     p.add_argument("--url", default=os.getenv("AI_URL", "http://localhost:1234/v1"), help="LM Studio server URL")
     p.add_argument("--model", default=os.getenv("AI_MODEL"), help="model id (default: first loaded model)")
     p.add_argument("--root", default=".", help="workspace directory the agent may touch (default: cwd)")
+    p.add_argument("--timeout", type=float, default=float(os.getenv("AI_TIMEOUT") or DEFAULT_TIMEOUT),
+                   help="seconds to wait for LM Studio to send *any* data before giving up (default: 600). "
+                        "Replies are streamed, so slow generation alone never trips this")
     a = p.parse_args()
 
     _reattach_tty()
-    agent = Agent(LMStudio(a.url, a.model), Toolbox(Path(a.root)))
+    agent = Agent(LMStudio(a.url, a.model, timeout=a.timeout), Toolbox(Path(a.root)))
     AiApp(agent, initial_prompt=" ".join(a.prompt).strip() or None).run()
 
 
