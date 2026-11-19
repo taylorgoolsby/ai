@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from urllib.parse import urlparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
 from typing import Callable
 
@@ -308,11 +308,26 @@ def _getopt(args: list[str], short_val: str = "", long_val=(), short_opt: str = 
 def _brace_expand(s: str, limit: int = 256) -> list[str] | None:
     """Expand {a,b} alternatives like a shell so every result can be checked.
     Returns None if that would produce more than `limit` paths."""
-    for m in re.finditer(r"\{([^{}]*)\}", s):
-        if "," in m.group(1):
+    for i, ch in enumerate(s):
+        if ch != "{":
+            continue
+        depth, commas, j = 0, [], i
+        while j < len(s):
+            if s[j] == "{":
+                depth += 1
+            elif s[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif s[j] == "," and depth == 1:
+                commas.append(j)
+            j += 1
+        if j < len(s) and commas:  # a balanced group with top-level commas
+            bounds = [i] + commas + [j]
             out: list[str] = []
-            for alt in m.group(1).split(","):
-                sub = _brace_expand(s[:m.start()] + alt + s[m.end():], limit)
+            for k in range(len(bounds) - 1):
+                alt = s[bounds[k] + 1:bounds[k + 1]]
+                sub = _brace_expand(s[:i] + alt + s[j + 1:], limit)
                 if sub is None:
                     return None
                 out += sub
@@ -944,7 +959,7 @@ def format_elapsed(seconds: float) -> str:
 
 
 class Agent:
-    def __init__(self, llm: LMStudio, toolbox: Toolbox, max_steps: int = 1000):
+    def __init__(self, llm: LMStudio, toolbox: Toolbox, max_steps: int = 25):
         self.llm, self.toolbox, self.max_steps = llm, toolbox, max_steps
         self.messages: list[dict] = []
         self.reset()
@@ -952,9 +967,18 @@ class Agent:
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": SYSTEM.format(root=self.toolbox.root)}]
 
-    def run(self, user_text: str, emit: Emit, approve: Approve) -> None:
+    def run(self, user_text: str, emit: Emit, approve: Approve,
+            unlimited: Callable[[], bool] | None = None) -> None:
+        """Run until the model answers without calling tools. The max_steps cap is
+        skipped while `unlimited()` is true; it's re-checked before every step, so
+        flipping it mid-run takes effect immediately."""
         self.messages.append({"role": "user", "content": user_text})
-        for _ in range(self.max_steps):
+        steps = 0
+        while True:
+            if steps >= self.max_steps and not (unlimited and unlimited()):
+                emit("error", f"Stopped after {steps} steps.")
+                return
+            steps += 1
             emit("status", "Thinking")
             msg = self.llm.chat(self.messages, self.toolbox.schemas())
             hint = summarize_reasoning(msg.get("reasoning_content") or msg.get("reasoning"))
@@ -971,7 +995,6 @@ class Agent:
                 return
             for call in calls:
                 self._run_call(call, emit, approve)
-        emit("error", f"Stopped after {self.max_steps} steps.")
 
     def _run_call(self, call: dict, emit: Emit, approve: Approve) -> None:
         fn = call["function"]
@@ -997,7 +1020,6 @@ class Agent:
             else:
                 allowed = True
                 if tool and tool.dangerous:
-                    emit("status", "Waiting for your approval")
                     allowed = approve(name, args)
                 if not allowed:
                     result = "User denied this action."
@@ -1100,6 +1122,7 @@ class ActivityPanel(Static):
         self.label = "Thinking"
         self.hints: list[str] = []
         self.expanded = True
+        self.supervised = True
         self._t0 = 0.0
         self._spin = 0
         self._ticker = None
@@ -1132,6 +1155,10 @@ class ActivityPanel(Static):
         self.expanded = not self.expanded
         self._redraw()
 
+    def set_supervised(self, supervised: bool) -> None:
+        self.supervised = supervised
+        self._redraw()
+
     def on_click(self) -> None:
         self.toggle()
 
@@ -1148,6 +1175,8 @@ class ActivityPanel(Static):
         t.append(self.label, style="bold")
         t.append(f"  {format_elapsed(time.monotonic() - self._t0)}  ", style="dim")
         t.append("\u25be" if self.expanded else "\u25b8", style="dim")
+        if not self.supervised:
+            t.append("  UNSUPERVISED", style="bold red")
         if self.expanded and self.hints:
             shown = self.hints[-self.MAX_HINTS:]
             older = len(self.hints) - len(shown)
@@ -1164,6 +1193,7 @@ class AiApp(App):
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "clear", "New chat"),
         Binding("ctrl+t", "toggle_activity", "Activity"),
+        Binding("ctrl+s", "toggle_supervision", "Supervision: on"),
     ]
     CSS = "#log { height: 1fr; padding: 0 1; overflow-x: hidden; } #prompt { dock: bottom; }"
 
@@ -1172,6 +1202,9 @@ class AiApp(App):
         self.agent = agent
         self.initial_prompt = initial_prompt
         self.busy = False
+        # True (default): write_file / edit_file / run_shell ask y/n and the agent stops
+        # after max_steps. False: they run without asking and the step limit is lifted.
+        self.supervision = True
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -1198,6 +1231,29 @@ class AiApp(App):
     def action_toggle_activity(self) -> None:
         self.query_one(ActivityPanel).toggle()
 
+    def action_toggle_supervision(self) -> None:
+        self.supervision = not self.supervision
+        self.title = "ai" if self.supervision else "ai \u2014 UNSUPERVISED"
+        self.query_one(ActivityPanel).set_supervised(self.supervision)
+        self._set_binding_label("ctrl+s", "Supervision: on" if self.supervision else "Supervision: OFF")
+        if self.supervision:
+            self._write(Text(f"Supervision ON: file writes, edits and shell commands ask for approval again, "
+                             f"and runs stop after {self.agent.max_steps} steps.", style="bold green"))
+        else:
+            self._write(Text("Supervision OFF: write_file, edit_file and run_shell now run WITHOUT asking, and "
+                             "there is no step limit. Blocked shell commands are still blocked. "
+                             "Press ctrl+s to turn it back on.", style="bold red"))
+
+    def _set_binding_label(self, key: str, description: str) -> None:
+        """Footer labels are static in Textual; swap the Binding to change one at runtime."""
+        try:
+            # assign a new list: the lists inside key_to_bindings are shared between App instances
+            self._bindings.key_to_bindings[key] = [
+                dataclass_replace(b, description=description) for b in self._bindings.key_to_bindings[key]]
+            self.refresh_bindings()
+        except (AttributeError, KeyError):
+            pass  # cosmetic only: the title and activity panel still show the state
+
     def on_input_submitted(self, e: Input.Submitted) -> None:
         text = e.value.strip()
         if not text or self.busy:
@@ -1218,7 +1274,7 @@ class AiApp(App):
     @work(thread=True, exclusive=True)
     def run_agent(self, text: str) -> None:
         try:
-            self.agent.run(text, self._emit, self._approve)
+            self.agent.run(text, self._emit, self._approve, unlimited=lambda: not self.supervision)
         except LLMError as err:
             self._emit("error", str(err))
         except Exception as err:
@@ -1249,8 +1305,20 @@ class AiApp(App):
         self.call_from_thread(self._write, item)
 
     def _approve(self, name: str, args: dict) -> bool:
-        # Temporarily disable asking for y/n approval - always allow dangerous tool calls
-        return True
+        if not self.supervision:
+            return True  # the command guard has already run; blocked commands never reach here
+        self.call_from_thread(self._set_status, "Waiting for your approval")
+        done, answer = threading.Event(), {"ok": False}
+
+        def cb(ok: bool | None) -> None:
+            answer["ok"] = bool(ok)
+            done.set()
+
+        self.call_from_thread(self.push_screen, ApprovalScreen(name, args), cb)
+        while not done.wait(0.25):
+            if not self.is_running:  # app was quit while the prompt was open: deny and let the thread end
+                return False
+        return answer["ok"]
 
 
 # --------------------------------------------------------------------------
