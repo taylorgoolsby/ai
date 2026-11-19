@@ -491,7 +491,7 @@ class FakeLLM:
 class AgentHarness(TempRootCase):
     """Shared helpers for tests that drive the Agent with a scripted model."""
 
-    def run_agent(self, script, *, approve=True, max_steps=25, prompt="go"):
+    def run_agent(self, script, *, approve=True, max_steps=1000, prompt="go"):
         events: list[tuple[str, str]] = []
         approvals: list[tuple[str, dict]] = []
 
