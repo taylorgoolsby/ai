@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -51,14 +52,14 @@ def _bootstrap() -> None:
 _bootstrap()
 
 import httpx  # noqa: E402
-from rich.markdown import Markdown  # noqa: E402
 from rich.text import Text  # noqa: E402
 from textual import work  # noqa: E402
 from textual.app import App, ComposeResult  # noqa: E402
 from textual.binding import Binding  # noqa: E402
-from textual.containers import Horizontal, Vertical  # noqa: E402
+from textual.containers import Horizontal, Vertical, VerticalScroll  # noqa: E402
 from textual.screen import ModalScreen  # noqa: E402
-from textual.widgets import Button, Footer, Header, Input, RichLog, Static  # noqa: E402
+from textual.widgets import Button, Footer, Header, Input, Static  # noqa: E402
+from textual.widgets import Markdown as MarkdownView  # noqa: E402
 
 
 # --------------------------------------------------------------------------
@@ -1186,45 +1187,53 @@ class Agent:
 # --------------------------------------------------------------------------
 # Textual TUI
 # --------------------------------------------------------------------------
-class WrapLog(RichLog):
-    """A RichLog that always wraps to its own width.
+# Tools that put text on the system clipboard, tried in order. Textual's own copy uses the
+# OSC 52 terminal escape, which some terminals (e.g. macOS Terminal.app) ignore.
+CLIPBOARD_TOOLS = (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"],
+                   ["xsel", "--clipboard", "--input"], ["clip.exe"])
 
-    RichLog renders every write at max(content width, min_width) and min_width
-    defaults to 78, which forces horizontal scrolling in narrower terminals; we
-    set it to 1. RichLog also bakes line breaks in at write time, so we keep the
-    renderables and re-render them whenever the width changes (terminal resize,
-    scrollbar appearing) so older output re-wraps too.
-    """
+
+def _copy_with_system_tool(text: str) -> bool:
+    for cmd in CLIPBOARD_TOOLS:
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.run(cmd, input=text.encode(), timeout=2, check=True,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except (OSError, subprocess.SubprocessError):
+                continue
+    return False
+
+
+class Transcript(VerticalScroll):
+    """The scrolling conversation log.
+
+    One widget per entry (a Static for plain text, Textual's Markdown for assistant replies) instead
+    of a RichLog, because these support mouse text selection (drag to select, double-click for one
+    entry, triple-click for everything, ctrl+c to copy) and re-wrap by themselves when the terminal is
+    resized. It never takes keyboard focus, so selecting in it doesn't pull typing away from the prompt."""
+
+    can_focus = False
 
     def __init__(self, **kw):
-        kw.setdefault("wrap", True)
-        kw.setdefault("min_width", 1)
         super().__init__(**kw)
-        self._history: list = []
-        self._width = 0
-        self._reflow_pending = False
+        self.entries: list[str] = []  # plain text of everything added so far
 
-    def add(self, renderable) -> None:
-        self._history.append(renderable)
-        self.write(renderable)
+    def on_mount(self) -> None:
+        self.anchor()  # follow new output, until the user scrolls up
+
+    def add(self, content, markdown: bool = False) -> None:
+        if markdown:
+            self.entries.append(str(content))
+            self.mount(MarkdownView(str(content)))
+        else:
+            text = content if isinstance(content, Text) else Text(str(content))
+            self.entries.append(text.plain)
+            self.mount(Static(text))
 
     def reset(self) -> None:
-        self._history.clear()
-        self.clear()
-
-    def on_resize(self, event) -> None:
-        width = event.size.width
-        if self._width and width and width != self._width and self._history and not self._reflow_pending:
-            self._reflow_pending = True
-            self.call_after_refresh(self._reflow)
-        if width:
-            self._width = width
-
-    def _reflow(self) -> None:
-        self._reflow_pending = False
-        self.clear()
-        for item in self._history:
-            self.write(item)
+        self.entries.clear()
+        self.remove_children()
 
 
 class ApprovalScreen(ModalScreen[bool]):
@@ -1353,8 +1362,14 @@ class AiApp(App):
         Binding("ctrl+l", "clear", "New chat"),
         Binding("ctrl+t", "toggle_activity", "Activity"),
         Binding("ctrl+s", "toggle_supervision", "Supervision: on"),
+        Binding("pageup", "log_page_up", "Scroll up", show=False),
+        Binding("pagedown", "log_page_down", "Scroll down", show=False),
     ]
-    CSS = "#log { height: 1fr; padding: 0 1; overflow-x: hidden; } #prompt { dock: bottom; }"
+    CSS = """
+    #log { height: 1fr; padding: 0 1; overflow-x: hidden; }
+    #log > Markdown { margin: 0; padding: 0; }
+    #prompt { dock: bottom; }
+    """
 
     def __init__(self, agent: Agent, initial_prompt: str | None = None):
         super().__init__()
@@ -1367,7 +1382,7 @@ class AiApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield WrapLog(id="log", markup=False, highlight=False)
+        yield Transcript(id="log")
         yield ActivityPanel(id="activity")
         yield Input(placeholder="Ask ai to build something...  (/clear to reset)", id="prompt")
         yield Footer()
@@ -1375,16 +1390,30 @@ class AiApp(App):
     def on_mount(self) -> None:
         self.sub_title = str(self.agent.toolbox.root)
         self.query_one(Input).focus()
-        self._write(Text(f"ai ready. Workspace: {self.agent.toolbox.root}", style="dim"))
+        self._write(Text(f"ai ready. Workspace: {self.agent.toolbox.root}\n"
+                         "Drag to select text; ctrl+c copies the selection.", style="dim"))
         if self.initial_prompt:
             self.submit(self.initial_prompt)
 
     def _write(self, renderable) -> None:
-        self.query_one(WrapLog).add(renderable)
+        self.query_one(Transcript).add(renderable)
+
+    def _write_markdown(self, text: str) -> None:
+        self.query_one(Transcript).add(text, markdown=True)
+
+    def action_log_page_up(self) -> None:  # the prompt has focus, so page keys are routed to the transcript
+        self.query_one(Transcript).scroll_page_up(animate=False)
+
+    def action_log_page_down(self) -> None:
+        self.query_one(Transcript).scroll_page_down(animate=False)
+
+    def copy_to_clipboard(self, text: str) -> None:
+        super().copy_to_clipboard(text)  # OSC 52: iTerm2, kitty, WezTerm, Ghostty, tmux (if enabled), ...
+        _copy_with_system_tool(text)     # pbcopy / wl-copy / xclip / xsel for terminals without OSC 52
 
     def action_clear(self) -> None:
         self.agent.reset()
-        self.query_one(WrapLog).reset()
+        self.query_one(Transcript).reset()
         self._write(Text("Conversation cleared.", style="dim"))
 
     def action_toggle_activity(self) -> None:
@@ -1465,9 +1494,11 @@ class AiApp(App):
         if kind == "progress":
             self.call_from_thread(self._set_detail, text)
             return
+        if kind == "assistant":
+            self.call_from_thread(self._write_markdown, text)
+            return
         style = {"tool": "yellow", "result": "dim", "error": "bold red"}.get(kind, "")
-        item = Markdown(text) if kind == "assistant" else Text(("  " if kind == "result" else "") + text, style=style)
-        self.call_from_thread(self._write, item)
+        self.call_from_thread(self._write, Text(("  " if kind == "result" else "") + text, style=style))
 
     def _approve(self, name: str, args: dict) -> bool:
         if not self.supervision:

@@ -28,6 +28,10 @@ import ai  # noqa: E402  (importing bootstraps textual/httpx on first run)
 NOTE_RE = re.compile(r"\.\.\. \[showing lines (\d+)-(\d+) of (\d+); (?:call read_file with offset=(\d+) to continue|end of file)\]$")
 
 
+def transcript_text(app) -> str:
+    return "\n".join(app.query_one(ai.Transcript).entries)
+
+
 def tool_call(name: str, args: dict | str, call_id: str = "1") -> dict:
     raw = args if isinstance(args, str) else json.dumps(args)
     return {"id": call_id, "type": "function", "function": {"name": name, "arguments": raw}}
@@ -790,7 +794,7 @@ class TuiActivityTests(unittest.IsolatedAsyncioTestCase):
             app.query_one(ai.Input).value = "hi"
             await pilot.press("enter")
             await self.wait_idle(app, pilot)
-            log_text = "\n".join(strip.text for strip in app.query_one(ai.RichLog).lines)
+            log_text = transcript_text(app)
             self.assertIn("all done", log_text)
             self.assertNotIn("Thinking", log_text)
 
@@ -822,111 +826,113 @@ class TuiActivityTests(unittest.IsolatedAsyncioTestCase):
 
 
 # --------------------------------------------------------------------------
-# Wrapping: no horizontal scrolling, text re-wraps when the terminal resizes
+# Transcript: wrapping, no horizontal scrolling, mouse selection, copying
 # --------------------------------------------------------------------------
-class TuiWrapTests(unittest.IsolatedAsyncioTestCase):
+class TuiTranscriptTests(unittest.IsolatedAsyncioTestCase):
     def make_app(self) -> "ai.AiApp":
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         return ai.AiApp(ai.Agent(FakeLLM([]), ai.Toolbox(Path(tmp.name))))
 
+    @staticmethod
+    async def settle(pilot) -> None:
+        await pilot.pause()
+        await pilot.pause()
+
     def assert_fits(self, log) -> None:
         width = log.scrollable_content_region.width
-        widest = max((strip.cell_length for strip in log.lines), default=0)
-        self.assertLessEqual(widest, width, "a line is wider than the log")
-        self.assertEqual(log.max_scroll_x, 0, "log can scroll horizontally")
+        self.assertEqual(log.max_scroll_x, 0, "transcript can scroll horizontally")
         self.assertFalse(log.show_horizontal_scrollbar)
+        for child in log.children:
+            self.assertLessEqual(child.region.width, width, f"{child} is wider than the transcript")
 
-    def long_items(self):
-        from rich.markdown import Markdown
-        from rich.text import Text
-        return [
-            Text("word " * 60),
-            Text("x" * 200),                               # one unbreakable token
-            Text("> " + "a long user prompt " * 10, style="bold cyan"),
-            Text("  " + "result line " * 20, style="dim"),
-            Markdown("A paragraph " * 30 + "\n\n```\n" + "y" * 200 + "\n```"),
-        ]
+    def add_long_items(self, app) -> None:
+        app._write(ai.Text("word " * 60))
+        app._write(ai.Text("x" * 200))                                  # one unbreakable token
+        app._write(ai.Text("> " + "a long user prompt " * 10, style="bold cyan"))
+        app._write(ai.Text("  " + "result line " * 20, style="dim"))
+        app._write_markdown("A paragraph " * 30 + "\n\n```\n" + "y" * 200 + "\n```")
 
+    async def drag(self, pilot, start_widget, start, end_widget, end) -> None:
+        await pilot.mouse_down(start_widget, offset=start)
+        await pilot.hover(end_widget, offset=end)
+        await pilot.mouse_up(end_widget, offset=end)
+        await self.settle(pilot)
+
+    def entry_widgets(self, app):
+        return list(app.query_one(ai.Transcript).children)
+
+    # ---- wrapping -------------------------------------------------------
     async def test_narrow_terminal_has_no_horizontal_scroll(self) -> None:
         app = self.make_app()
         async with app.run_test(size=(40, 20)) as pilot:
-            for item in self.long_items():
-                app._write(item)
-            await pilot.pause()
-            await pilot.pause()
-            log = app.query_one(ai.WrapLog)
-            self.assertGreater(len(log.lines), 10)  # it really did wrap
+            self.add_long_items(app)
+            await self.settle(pilot)
+            log = app.query_one(ai.Transcript)
+            self.assertGreater(log.virtual_size.height, 20)  # it really did wrap
             self.assert_fits(log)
+            wrapped = {c.region.height for c in log.children if isinstance(c, ai.Static)}
+            self.assertTrue(any(h >= 4 for h in wrapped), wrapped)
 
     async def test_wide_terminal_does_not_stretch_short_lines(self) -> None:
         app = self.make_app()
         async with app.run_test(size=(120, 20)) as pilot:
             app._write(ai.Text("short"))
-            await pilot.pause()
-            log = app.query_one(ai.WrapLog)
-            self.assert_fits(log)
+            await self.settle(pilot)
+            self.assert_fits(app.query_one(ai.Transcript))
 
     async def test_existing_output_rewraps_when_terminal_shrinks_and_grows(self) -> None:
         app = self.make_app()
         async with app.run_test(size=(100, 30)) as pilot:
-            log = app.query_one(ai.WrapLog)
-            for item in self.long_items():
-                app._write(item)
-            await pilot.pause()
-            await pilot.pause()
-            wide_lines = len(log.lines)
+            log = app.query_one(ai.Transcript)
+            self.add_long_items(app)
+            await self.settle(pilot)
+            wide = log.virtual_size.height
             self.assert_fits(log)
 
             await pilot.resize_terminal(40, 30)
-            await pilot.pause()
-            await pilot.pause()
-            self.assertGreater(len(log.lines), wide_lines)
+            await self.settle(pilot)
+            self.assertGreater(log.virtual_size.height, wide)
             self.assert_fits(log)
 
             await pilot.resize_terminal(100, 30)
-            await pilot.pause()
-            await pilot.pause()
-            self.assertEqual(len(log.lines), wide_lines)
+            await self.settle(pilot)
+            self.assertEqual(log.virtual_size.height, wide)
             self.assert_fits(log)
 
-    async def test_reflow_does_not_duplicate_or_lose_history(self) -> None:
+    # ---- bookkeeping ----------------------------------------------------
+    async def test_entries_match_the_widgets_on_screen(self) -> None:
         app = self.make_app()
         async with app.run_test(size=(100, 30)) as pilot:
-            log = app.query_one(ai.WrapLog)
-            before = len(log._history)
-            for item in self.long_items():
-                app._write(item)
-            await pilot.pause()
-            self.assertEqual(len(log._history), before + 5)
-            await pilot.resize_terminal(50, 30)
-            await pilot.pause()
-            await pilot.pause()
-            self.assertEqual(len(log._history), before + 5)
+            log = app.query_one(ai.Transcript)
+            before = len(log.entries)
+            self.add_long_items(app)
+            await self.settle(pilot)
+            self.assertEqual(len(log.entries), before + 5)
+            self.assertEqual(len(log.children), len(log.entries))
+            self.assertIn("ctrl+c", log.entries[0])  # the startup banner tells you how to copy
 
-    async def test_clear_forgets_history_so_resize_cannot_resurrect_it(self) -> None:
+    async def test_clear_removes_everything_and_survives_resizes(self) -> None:
         app = self.make_app()
         async with app.run_test(size=(100, 30)) as pilot:
-            log = app.query_one(ai.WrapLog)
+            log = app.query_one(ai.Transcript)
             app._write(ai.Text("old content " * 20))
-            await pilot.pause()
+            await self.settle(pilot)
             app.action_clear()
-            await pilot.pause()
-            self.assertEqual(len(log._history), 1)  # just "Conversation cleared."
+            await self.settle(pilot)
+            self.assertEqual(log.entries, ["Conversation cleared."])
+            self.assertEqual(len(log.children), 1)
             await pilot.resize_terminal(40, 30)
-            await pilot.pause()
-            await pilot.pause()
-            text = "\n".join(strip.text for strip in log.lines)
-            self.assertIn("Conversation cleared.", text)
-            self.assertNotIn("old content", text)
+            await self.settle(pilot)
+            self.assertEqual(transcript_text(app), "Conversation cleared.")
+            self.assertEqual(len(log.children), 1)
 
     async def test_approval_dialog_wraps_long_arguments(self) -> None:
         app = self.make_app()
         async with app.run_test(size=(40, 24)) as pilot:
             args = {"command": "echo " + "z" * 150, "path": "some/deeply/" * 10 + "file.txt"}
             app.push_screen(ai.ApprovalScreen("run_shell", args))
-            await pilot.pause()
-            await pilot.pause()
+            await self.settle(pilot)
             detail = app.screen.query_one("#detail")
             box = app.screen.query_one("#box")
             self.assertLessEqual(detail.region.right, box.region.right)
@@ -934,6 +940,168 @@ class TuiWrapTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(detail.show_horizontal_scrollbar)
             self.assertEqual(detail.max_scroll_x, 0)
 
+    # ---- selecting and copying -------------------------------------------
+    async def test_drag_selects_text_in_the_transcript(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._write(ai.Text("alpha beta gamma delta epsilon"))
+            await self.settle(pilot)
+            widget = self.entry_widgets(app)[-1]
+            await self.drag(pilot, widget, (0, 0), widget, (9, 0))
+            selected = app.screen.get_selected_text()
+            self.assertTrue(selected.startswith("alpha beta"), repr(selected))
+            self.assertNotIn("gamma", selected)
+
+    async def test_selection_can_span_several_entries(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._write(ai.Text("first entry text"))
+            app._write(ai.Text("  second entry text", style="dim"))
+            app._write(ai.Text("third entry text", style="yellow"))
+            await self.settle(pilot)
+            first, _, third = self.entry_widgets(app)[-3:]
+            await self.drag(pilot, first, (0, 0), third, (8, 0))
+            selected = app.screen.get_selected_text()
+            for part in ("first entry text", "second entry text", "third en"):
+                self.assertIn(part, selected)
+
+    async def test_assistant_markdown_replies_are_selectable_too(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._write_markdown("Hello **bold** world, this is a reply.")
+            await self.settle(pilot)
+            await self.settle(pilot)
+            reply = self.entry_widgets(app)[-1]
+            paragraph = next(w for w in reply.walk_children() if w.region.height and "Hello" in str(getattr(w, "content", "")))
+            await self.drag(pilot, paragraph, (0, 0), paragraph, (20, 0))
+            self.assertIn("Hello", app.screen.get_selected_text())
+
+    async def test_selecting_does_not_steal_keyboard_focus_from_the_prompt(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._write(ai.Text("select me please"))
+            await self.settle(pilot)
+            widget = self.entry_widgets(app)[-1]
+            await self.drag(pilot, widget, (0, 0), widget, (8, 0))
+            self.assertIsInstance(app.focused, ai.Input)
+            await pilot.press("h", "i")
+            self.assertEqual(app.query_one(ai.Input).value, "hi")
+            self.assertFalse(ai.Transcript.can_focus)
+
+    async def test_double_click_selects_one_entry_and_triple_click_selects_everything(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._write(ai.Text("alpha beta gamma delta epsilon"))
+            app._write(ai.Text("second line here"))
+            await self.settle(pilot)
+            widget = self.entry_widgets(app)[-2]
+            await pilot.click(widget, offset=(7, 0), times=2)
+            await self.settle(pilot)
+            self.assertEqual(app.screen.get_selected_text(), "alpha beta gamma delta epsilon")
+            await pilot.click(widget, offset=(7, 0), times=3)
+            await self.settle(pilot)
+            everything = app.screen.get_selected_text()
+            for part in ("ai ready", "alpha beta gamma delta epsilon", "second line here"):
+                self.assertIn(part, everything)
+
+    async def test_ctrl_c_copies_the_selection(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app._write(ai.Text("copy this sentence"))
+            await self.settle(pilot)
+            widget = self.entry_widgets(app)[-1]
+            await self.drag(pilot, widget, (0, 0), widget, (8, 0))
+            with mock.patch.object(ai, "_copy_with_system_tool") as system_copy:
+                await pilot.press("ctrl+c")
+                await self.settle(pilot)
+            self.assertTrue(app.clipboard.startswith("copy this"), repr(app.clipboard))
+            system_copy.assert_called_once_with(app.clipboard)
+
+    async def test_ctrl_c_without_a_selection_does_not_copy_or_quit(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            with mock.patch.object(ai, "_copy_with_system_tool") as system_copy:
+                await pilot.press("ctrl+c")
+                await self.settle(pilot)
+            system_copy.assert_not_called()
+            self.assertTrue(app.is_running)
+
+    # ---- scrolling ---------------------------------------------------------
+    async def test_follows_new_output_by_default(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            log = app.query_one(ai.Transcript)
+            for i in range(80):
+                app._write(ai.Text(f"line {i}"))
+            await self.settle(pilot)
+            self.assertGreater(log.max_scroll_y, 0)
+            self.assertGreaterEqual(log.scroll_y, log.max_scroll_y - 1)
+
+    async def test_page_keys_scroll_the_transcript_while_the_prompt_has_focus(self) -> None:
+        app = self.make_app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            log = app.query_one(ai.Transcript)
+            for i in range(80):
+                app._write(ai.Text(f"line {i}"))
+            await self.settle(pilot)
+            bottom = log.scroll_y
+
+            await pilot.press("pageup")
+            await self.settle(pilot)
+            self.assertLess(log.scroll_y, bottom)
+            self.assertIsInstance(app.focused, ai.Input)
+
+            # new output must not yank the view back down while reading earlier output
+            reading_at = log.scroll_y
+            for i in range(10):
+                app._write(ai.Text(f"new line {i}"))
+            await self.settle(pilot)
+            self.assertEqual(log.scroll_y, reading_at)
+
+            # paging back to the bottom resumes following
+            for _ in range(20):
+                await pilot.press("pagedown")
+            await self.settle(pilot)
+            self.assertGreaterEqual(log.scroll_y, log.max_scroll_y - 1)
+            app._write(ai.Text("the newest line"))
+            await self.settle(pilot)
+            self.assertGreaterEqual(log.scroll_y, log.max_scroll_y - 1)
+
+
+class SystemClipboardTests(unittest.TestCase):
+    def test_uses_the_first_tool_that_is_installed(self) -> None:
+        with mock.patch.object(ai.shutil, "which", side_effect=lambda n: f"/usr/bin/{n}" if n == "xclip" else None), \
+                mock.patch.object(ai.subprocess, "run") as run:
+            self.assertTrue(ai._copy_with_system_tool("héllo"))
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd, ["xclip", "-selection", "clipboard"])
+        self.assertEqual(run.call_args.kwargs["input"], "héllo".encode())
+
+    def test_macos(self) -> None:
+        with mock.patch.object(ai.shutil, "which", side_effect=lambda n: "/usr/bin/pbcopy" if n == "pbcopy" else None), \
+                mock.patch.object(ai.subprocess, "run") as run:
+            self.assertTrue(ai._copy_with_system_tool("x"))
+        self.assertEqual(run.call_args.args[0], ["pbcopy"])
+
+    def test_falls_through_a_tool_that_fails(self) -> None:
+        def run(cmd, **kw):
+            if cmd[0] == "wl-copy":
+                raise ai.subprocess.CalledProcessError(1, cmd)
+
+        with mock.patch.object(ai.shutil, "which", side_effect=lambda n: f"/usr/bin/{n}" if n in ("wl-copy", "xsel") else None), \
+                mock.patch.object(ai.subprocess, "run", side_effect=run) as r:
+            self.assertTrue(ai._copy_with_system_tool("x"))
+        self.assertEqual([c.args[0][0] for c in r.call_args_list], ["wl-copy", "xsel"])
+
+    def test_no_tool_installed_is_not_an_error(self) -> None:
+        with mock.patch.object(ai.shutil, "which", return_value=None), mock.patch.object(ai.subprocess, "run") as run:
+            self.assertFalse(ai._copy_with_system_tool("x"))
+        run.assert_not_called()
+
+    def test_hanging_tool_is_given_up_on(self) -> None:
+        with mock.patch.object(ai.shutil, "which", return_value="/usr/bin/pbcopy"), \
+                mock.patch.object(ai.subprocess, "run", side_effect=ai.subprocess.TimeoutExpired("pbcopy", 2)):
+            self.assertFalse(ai._copy_with_system_tool("x"))
 
 # --------------------------------------------------------------------------
 # Shell guard regression tests: every bypass found so far must stay closed,
@@ -1326,7 +1494,7 @@ class TuiSupervisionTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(panel.supervised)
             panel._t0 = ai.time.monotonic()
             self.assertIn("UNSUPERVISED", panel.build_text().plain)
-            log_text = "\n".join(strip.text for strip in app.query_one(ai.WrapLog).lines)
+            log_text = transcript_text(app)
             self.assertIn("Supervision OFF", log_text)
 
             await pilot.press("ctrl+s")
@@ -1393,7 +1561,7 @@ class TuiSupervisionTests(unittest.IsolatedAsyncioTestCase):
             await self.submit(app, pilot)
             await self.wait_idle(app, pilot)
             self.assertFalse((self.root.parent / "escaped.txt").exists())
-            log_text = "\n".join(strip.text for strip in app.query_one(ai.WrapLog).lines)
+            log_text = transcript_text(app)
             self.assertIn("blocked run_shell", log_text)
 
     async def test_step_limit_applies_when_supervised_and_is_lifted_when_not(self) -> None:
@@ -1403,7 +1571,7 @@ class TuiSupervisionTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             await self.submit(app, pilot)
             await self.wait_idle(app, pilot)
-            log_text = "\n".join(strip.text for strip in app.query_one(ai.WrapLog).lines)
+            log_text = transcript_text(app)
             self.assertIn("Stopped after 3 steps.", log_text)
             self.assertNotIn("all done", log_text)
 
@@ -1412,7 +1580,7 @@ class TuiSupervisionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+s")
             await self.submit(app, pilot)
             await self.wait_idle(app, pilot)
-            log_text = "\n".join(strip.text for strip in app.query_one(ai.WrapLog).lines)
+            log_text = transcript_text(app)
             self.assertNotIn("Stopped after", log_text)
             self.assertIn("all done", log_text)
 
@@ -1892,7 +2060,7 @@ class TuiStreamingTests(unittest.IsolatedAsyncioTestCase):
                     break
             self.assertFalse(app.busy)
             self.assertFalse(panel.display)
-            log_text = "\n".join(strip.text for strip in app.query_one(ai.WrapLog).lines)
+            log_text = transcript_text(app)
             self.assertNotIn("1,234 chars", log_text)  # progress is live-only, not transcript noise
 
     async def test_new_status_clears_the_previous_detail(self) -> None:
