@@ -944,7 +944,7 @@ def format_elapsed(seconds: float) -> str:
 
 
 class Agent:
-    def __init__(self, llm: LMStudio, toolbox: Toolbox, max_steps: int = 1000):
+    def __init__(self, llm: LMStudio, toolbox: Toolbox, max_steps: int = 25):
         self.llm, self.toolbox, self.max_steps = llm, toolbox, max_steps
         self.messages: list[dict] = []
         self.reset()
