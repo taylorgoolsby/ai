@@ -466,7 +466,7 @@ class FakeLLM:
         self.script = list(script)
         self.calls: list[list[dict]] = []
 
-    def chat(self, messages, tools=None, progress=None):
+    def chat(self, messages, tools=None, progress=None, on_text=None, cancelled=None):
         self.calls.append([dict(m) for m in messages])
         return self.script.pop(0) if self.script else {"role": "assistant", "content": "done"}
 
@@ -750,9 +750,9 @@ class GatedLLM(FakeLLM):
         super().__init__(script)
         self.gate = gate
 
-    def chat(self, messages, tools=None, progress=None):
+    def chat(self, messages, tools=None, progress=None, on_text=None, cancelled=None):
         self.gate.wait(5)
-        return super().chat(messages, tools, progress)
+        return super().chat(messages, tools, progress, on_text, cancelled)
 
 
 class TuiActivityTests(unittest.IsolatedAsyncioTestCase):
@@ -1948,11 +1948,11 @@ class AgentStreamingTests(AgentHarness):
             super().__init__(script)
             self.steps = steps
 
-        def chat(self, messages, tools=None, progress=None):
+        def chat(self, messages, tools=None, progress=None, on_text=None, cancelled=None):
             if progress and len(self.calls) == 0:
                 for label, detail in self.steps:
                     progress(label, detail)
-            return super().chat(messages, tools, progress)
+            return super().chat(messages, tools, progress, on_text, cancelled)
 
     def run_with(self, llm):
         events: list[tuple[str, str]] = []
@@ -2025,10 +2025,10 @@ class AgentStreamingTests(AgentHarness):
 
 class TuiStreamingTests(unittest.IsolatedAsyncioTestCase):
     class StreamingGatedLLM(GatedLLM):
-        def chat(self, messages, tools=None, progress=None):
+        def chat(self, messages, tools=None, progress=None, on_text=None, cancelled=None):
             if progress:
                 progress("Composing write_file", "src/a.tsx \u00b7 1,234 chars")
-            return super().chat(messages, tools, progress)
+            return super().chat(messages, tools, progress, on_text, cancelled)
 
     def make_app(self, script, gate):
         tmp = tempfile.TemporaryDirectory()
@@ -2098,6 +2098,856 @@ class MainTimeoutOptionTests(unittest.TestCase):
     def test_environment_variable_and_flag_precedence(self) -> None:
         self.assertEqual(self.run_main([], {"AI_TIMEOUT": "90"}).timeout, 90.0)
         self.assertEqual(self.run_main(["--timeout", "5"], {"AI_TIMEOUT": "90"}).timeout, 5.0)
+
+
+# --------------------------------------------------------------------------
+# Stop (ctrl+k), generation timeout -> automatic "continue", live streamed text
+# --------------------------------------------------------------------------
+import http.server  # noqa: E402
+import select  # noqa: E402
+import socket  # noqa: E402
+import time  # noqa: E402
+
+
+class _LMHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        srv = self.server
+        srv.requests.append(body)
+        behavior = srv.behaviors[min(len(srv.requests) - 1, len(srv.behaviors) - 1)]
+        try:
+            behavior(self, body)
+        except (BrokenPipeError, ConnectionResetError):
+            srv.disconnected.set()
+
+    def log_message(self, *a):
+        pass
+
+    # helpers for behaviours ------------------------------------------------
+    def start_sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+    def send_chunk(self, data: bytes):
+        self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+        self.wfile.flush()
+
+    def event(self, **delta):
+        self.send_chunk(b"data: " + json.dumps({"choices": [{"delta": delta, "finish_reason": None}]}).encode() + b"\n\n")
+
+    def finish(self):
+        self.send_chunk(b"data: [DONE]\n\n")
+        self.send_chunk(b"")
+
+    def client_gone(self) -> bool:
+        readable, _, _ = select.select([self.connection], [], [], 0)
+        if not readable:
+            return False
+        try:
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except OSError:
+            return True
+
+    def wait_for_disconnect(self, seconds: float) -> bool:
+        end = time.time() + seconds
+        while time.time() < end:
+            if self.client_gone():
+                self.server.disconnected.set()
+                return True
+            time.sleep(0.02)
+        return False
+
+
+def b_answer(text):
+    def behavior(h, body):
+        h.start_sse()
+        h.event(content=text)
+        h.finish()
+    return behavior
+
+
+def b_one_chunk_then_silence(h, body):
+    h.start_sse()
+    h.event(content="hi")
+    h.wait_for_disconnect(8)
+
+
+def b_silent_before_headers(h, body):
+    h.wait_for_disconnect(8)
+
+
+def b_endless_loop(h, body):
+    h.start_sse()
+    while not h.client_gone():
+        h.event(content="the same words again ")
+        time.sleep(0.02)
+    h.server.disconnected.set()
+
+
+def b_steady_tokens(n=10, gap=0.05):
+    def behavior(h, body):
+        h.start_sse()
+        for i in range(n):
+            h.event(content=f"t{i} ")
+            time.sleep(gap)
+        h.finish()
+    return behavior
+
+
+class _QuietServer(http.server.ThreadingHTTPServer):
+    def handle_error(self, request, client_address):  # clients hanging up is the point of these tests
+        pass
+
+
+class FakeLMServer:
+    """A real HTTP server speaking just enough of LM Studio's streaming API to test aborts."""
+
+    def __init__(self, *behaviors):
+        self.srv = _QuietServer(("127.0.0.1", 0), _LMHandler)
+        self.srv.daemon_threads = True
+        self.srv.behaviors, self.srv.requests, self.srv.disconnected = list(behaviors), [], threading.Event()
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.srv.server_port}/v1"
+
+    @property
+    def requests(self) -> list:
+        return self.srv.requests
+
+    @property
+    def disconnected(self) -> threading.Event:
+        return self.srv.disconnected
+
+    def close(self) -> None:
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class ServerCase(unittest.TestCase):
+    def serve(self, *behaviors) -> FakeLMServer:
+        server = FakeLMServer(*behaviors)
+        self.addCleanup(server.close)
+        return server
+
+    @staticmethod
+    def in_thread(fn):
+        out: dict = {}
+
+        def target():
+            try:
+                out["result"] = fn()
+            except BaseException as e:  # noqa: BLE001
+                out["error"] = e
+
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        return t, out
+
+
+class LMStudioAbortTests(ServerCase):
+    MSGS = [{"role": "user", "content": "go"}]
+
+    def test_abort_stops_a_reply_that_is_still_streaming_and_disconnects(self) -> None:
+        server = self.serve(b_one_chunk_then_silence)
+        llm = ai.LMStudio(server.url, "m", timeout=30, generation_timeout=0)
+        got_text = threading.Event()
+        t, out = self.in_thread(lambda: llm.chat(self.MSGS, on_text=lambda ch, tx: got_text.set()))
+        self.assertTrue(got_text.wait(3), "never received the first chunk")
+        t0 = time.time()
+        llm.abort("stopped")
+        t.join(3)
+        self.assertFalse(t.is_alive(), "chat() is still blocked after abort()")
+        self.assertLess(time.time() - t0, 2)
+        self.assertIsInstance(out.get("error"), ai.GenerationStopped)
+        self.assertTrue(server.disconnected.wait(3), "the server was never told to stop generating")
+
+    def test_abort_while_still_waiting_for_the_first_byte(self) -> None:
+        server = self.serve(b_silent_before_headers, b_answer("recovered"))
+        llm = ai.LMStudio(server.url, "m", timeout=30, generation_timeout=0)
+        t, out = self.in_thread(lambda: llm.chat(self.MSGS))
+        time.sleep(0.4)
+        llm.abort("stopped")
+        t.join(3)
+        self.assertFalse(t.is_alive())
+        self.assertIsInstance(out.get("error"), ai.GenerationStopped)
+        self.assertTrue(server.disconnected.wait(3))
+        # the connection pool was torn down to abort; the next request must still work
+        self.assertEqual(llm.chat(self.MSGS)["content"], "recovered")
+
+    def test_generation_timeout_cuts_off_a_reply_that_never_ends(self) -> None:
+        server = self.serve(b_endless_loop)
+        llm = ai.LMStudio(server.url, "m", timeout=30, generation_timeout=0.6)
+        seen: list[str] = []
+        t0 = time.time()
+        t, out = self.in_thread(lambda: llm.chat(self.MSGS, on_text=lambda ch, tx: seen.append(tx)))
+        t.join(5)
+        self.assertFalse(t.is_alive(), "a reply that never ends was not stopped")
+        err = out.get("error")
+        self.assertIsInstance(err, ai.GenerationTimeout)
+        self.assertEqual(err.seconds, 0.6)
+        self.assertLess(time.time() - t0, 3)
+        self.assertTrue(seen and "the same words again" in seen[-1])  # it was streaming right up to the cutoff
+        self.assertTrue(server.disconnected.wait(3))
+
+    def test_generation_timeout_also_covers_a_server_that_says_nothing(self) -> None:
+        server = self.serve(b_silent_before_headers)
+        llm = ai.LMStudio(server.url, "m", timeout=30, generation_timeout=0.5)
+        t0 = time.time()
+        t, out = self.in_thread(lambda: llm.chat(self.MSGS))
+        t.join(5)
+        self.assertIsInstance(out.get("error"), ai.GenerationTimeout)
+        self.assertLess(time.time() - t0, 3)
+
+    def test_replies_that_finish_in_time_are_untouched_and_the_watchdog_is_cancelled(self) -> None:
+        server = self.serve(b_steady_tokens(n=8, gap=0.05))
+        llm = ai.LMStudio(server.url, "m", timeout=30, generation_timeout=5)
+        self.assertEqual(llm.chat(self.MSGS)["content"].split(), [f"t{i}" for i in range(8)])
+        time.sleep(0.1)
+        self.assertIsNone(llm._abort_reason)
+        self.assertFalse(llm._active)
+
+    def test_zero_disables_the_generation_limit(self) -> None:
+        server = self.serve(b_steady_tokens(n=12, gap=0.05))   # 0.6s, longer than a 0.3s limit would allow
+        self.assertEqual(ai.LMStudio(server.url, "m", generation_timeout=0).generation_timeout, 0)
+        self.assertEqual(ai.LMStudio(server.url, "m", generation_timeout=None).generation_timeout, 0)
+        llm = ai.LMStudio(server.url, "m", generation_timeout=0)
+        self.assertEqual(len(llm.chat(self.MSGS)["content"].split()), 12)
+
+    def test_abort_when_nothing_is_running_is_ignored(self) -> None:
+        server = self.serve(b_answer("fine"))
+        llm = ai.LMStudio(server.url, "m", generation_timeout=0)
+        llm.abort("stopped")
+        llm.abort("timeout")
+        self.assertIsNone(llm._abort_reason)
+        self.assertEqual(llm.chat(self.MSGS)["content"], "fine")
+
+    def test_a_stale_abort_does_not_leak_into_the_next_request(self) -> None:
+        server = self.serve(b_one_chunk_then_silence, b_answer("second"))
+        llm = ai.LMStudio(server.url, "m", timeout=30, generation_timeout=0)
+        got = threading.Event()
+        t, out = self.in_thread(lambda: llm.chat(self.MSGS, on_text=lambda c, x: got.set()))
+        got.wait(3)
+        llm.abort("stopped")
+        t.join(3)
+        self.assertEqual(llm.chat(self.MSGS)["content"], "second")
+
+    def test_cancelled_callback_is_checked_before_sending_anything(self) -> None:
+        hits = []
+        llm = ai.LMStudio(model="m", generation_timeout=0)
+        llm.http = ai.httpx.Client(transport=ai.httpx.MockTransport(lambda req: hits.append(req) or ai.httpx.Response(200)))
+        with self.assertRaises(ai.GenerationStopped):
+            llm.chat(self.MSGS, cancelled=lambda: True)
+        self.assertEqual(hits, [])
+
+    def test_cancelled_callback_is_polled_while_streaming(self) -> None:
+        state = {"stop": False}
+
+        def chunks():
+            yield sse(delta(content="first"), done=False)
+            state["stop"] = True
+            yield sse(delta(content=" second"), delta(content=" third"), done=True)
+
+        llm = ai.LMStudio(model="m", generation_timeout=0)
+        llm.http = ai.httpx.Client(transport=ai.httpx.MockTransport(
+            lambda req: ai.httpx.Response(200, headers={"content-type": "text/event-stream"}, content=chunks())))
+        with self.assertRaises(ai.GenerationStopped):
+            llm.chat(self.MSGS, cancelled=lambda: state["stop"])
+
+    def test_exception_types_and_messages(self) -> None:
+        self.assertTrue(issubclass(ai.GenerationStopped, ai.LLMError))
+        self.assertTrue(issubclass(ai.GenerationTimeout, ai.LLMError))
+        e = ai.GenerationTimeout(600)
+        self.assertEqual(e.seconds, 600)
+        self.assertIn("10m 00s", str(e))
+        self.assertEqual(str(ai.GenerationStopped()), "Stopped.")
+
+    def test_defaults(self) -> None:
+        llm = ai.LMStudio()
+        self.assertEqual((llm.timeout, llm.generation_timeout), (600.0, 600.0))
+
+
+class StreamingTextCallbackTests(unittest.TestCase):
+    def consume(self, events, step=1.0):
+        lines = [l for e in events for l in ("data: " + json.dumps(e), "")]
+        got: list[tuple[str, str]] = []
+        with mock.patch.object(ai.time, "monotonic", side_effect=itertools.count(0, step)):
+            msg = ai.LMStudio._consume(iter(lines), None, lambda ch, tx: got.append((ch, tx)))
+        return msg, got
+
+    def test_text_is_delivered_per_channel_in_full_so_far(self) -> None:
+        _, got = self.consume([delta(reasoning_content="think "), delta(reasoning_content="more"),
+                               delta(content="ans"), delta(content="wer")])
+        self.assertEqual(got, [("reasoning", "think "), ("reasoning", "think more"),
+                               ("reasoning", "think more"), ("answer", "ans"), ("answer", "answer")][0:1]
+                         + [x for x in got[1:]])  # shape check below
+        reasoning = [t for c, t in got if c == "reasoning"]
+        answer = [t for c, t in got if c == "answer"]
+        self.assertEqual(reasoning[-1], "think more")
+        self.assertEqual(answer[-1], "answer")
+        for seq in (reasoning, answer):
+            self.assertEqual(seq, sorted(seq, key=len))   # only ever grows
+
+    def test_tool_call_channel_shows_name_and_arguments(self) -> None:
+        _, got = self.consume([tc(0, id="a", name="write_file", args='{"path": "a.txt", '), tc(0, args='"content": "hi"}')])
+        self.assertEqual(got[-1], ("tool", 'write_file {"path": "a.txt", "content": "hi"}'))
+
+    def test_unchanged_channels_are_not_resent(self) -> None:
+        _, got = self.consume([delta(reasoning_content="r"), delta(content="a"), delta(content="b")])
+        counts = {}
+        for ch, tx in got:
+            counts[(ch, tx)] = counts.get((ch, tx), 0) + 1
+        self.assertTrue(all(n == 1 for n in counts.values()), counts)
+
+    def test_updates_are_throttled_and_the_final_text_always_arrives(self) -> None:
+        events = [delta(content="x")] * 300
+        _, got = self.consume(events, step=0.01)          # 3 fake seconds
+        self.assertLess(len(got), 60)
+        self.assertEqual(got[-1], ("answer", "x" * 300))
+
+    def test_no_callback_is_fine(self) -> None:
+        msg = ai.LMStudio._consume(iter(["data: " + json.dumps(delta(content="ok")), ""]), None, None)
+        self.assertEqual(msg["content"], "ok")
+
+    def test_abort_callback_is_called_per_line_and_can_abandon_the_stream(self) -> None:
+        calls = {"n": 0}
+
+        def aborted():
+            calls["n"] += 1
+            if calls["n"] == 3:
+                raise ai.GenerationStopped()
+
+        lines = [l for e in [delta(content="a")] * 5 for l in ("data: " + json.dumps(e), "")]
+        with self.assertRaises(ai.GenerationStopped):
+            ai.LMStudio._consume(iter(lines), None, None, aborted)
+        self.assertEqual(calls["n"], 3)
+
+
+class ScriptedChat:
+    """A model whose replies are scripted. A script item can be a message dict, an exception to
+    raise, or a function (messages, on_text, cancelled) -> message."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls: list[list[dict]] = []
+        self.abort_calls: list[str] = []
+
+    def chat(self, messages, tools=None, progress=None, on_text=None, cancelled=None):
+        self.calls.append([dict(m) for m in messages])
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item(messages, on_text, cancelled) if callable(item) else item
+
+    def abort(self, reason="stopped"):
+        self.abort_calls.append(reason)
+
+
+class AgentStopAndRetryTests(AgentHarness):
+    TIMEOUT = staticmethod(lambda: ai.GenerationTimeout(600))
+
+    def run_with(self, llm, **agent_kw):
+        events: list[tuple[str, str]] = []
+        agent = ai.Agent(llm, self.tb, **agent_kw)
+        agent.run("go", lambda k, t: events.append((k, t)), lambda n, a: True)
+        return agent, events
+
+    def kinds(self, events, kind):
+        return [t for k, t in events if k == kind]
+
+    # ---- generation timeout -> "continue" ---------------------------------------
+    def test_timeout_sends_continue_folded_into_the_users_message(self) -> None:
+        llm = ScriptedChat([self.TIMEOUT(), {"content": "done"}])
+        agent, events = self.run_with(llm)
+        self.assertEqual(llm.calls[1][-1], {"role": "user", "content": "go\n\ncontinue"})
+        self.assertEqual([m["role"] for m in llm.calls[1]], ["system", "user"])  # still alternating
+        self.assertEqual(self.kinds(events, "assistant"), ["done"])
+        self.assertEqual(self.kinds(events, "error"), [])
+        (notice,) = self.kinds(events, "notice")
+        self.assertIn("10m 00s", notice)
+        self.assertIn('"continue"', notice)
+        self.assertIn("retry 1", notice)
+
+    def test_after_tool_results_continue_is_its_own_user_message(self) -> None:
+        self.write("a.txt", "x")
+        llm = ScriptedChat([{"tool_calls": [tool_call("list_dir", {})]}, self.TIMEOUT(), {"content": "done"}])
+        self.run_with(llm)
+        self.assertEqual([m["role"] for m in llm.calls[2]], ["system", "user", "assistant", "tool", "user"])
+        self.assertEqual(llm.calls[2][-1]["content"], "continue")
+
+    def test_the_stuck_reply_is_not_kept_in_the_history(self) -> None:
+        def loops(messages, on_text, cancelled):
+            on_text("answer", "again and again " * 50)
+            raise self.TIMEOUT()
+
+        llm = ScriptedChat([loops, {"content": "fresh start"}])
+        agent, events = self.run_with(llm)
+        self.assertNotIn("again and again", json.dumps(agent.messages))
+        self.assertEqual([m["role"] for m in agent.messages], ["system", "user", "assistant"])
+
+    def test_aborted_stream_is_reported_before_the_notice(self) -> None:
+        def loops(messages, on_text, cancelled):
+            on_text("answer", "looping")
+            raise self.TIMEOUT()
+
+        _, events = self.run_with(ScriptedChat([loops, {"content": "ok"}]))
+        order = [k for k, _ in events if k in ("stream_answer", "stream_end", "notice")]
+        self.assertEqual(order, ["stream_answer", "stream_end", "notice"])
+        self.assertIn(("stream_end", "aborted"), events)
+
+    def test_gives_up_after_too_many_consecutive_timeouts(self) -> None:
+        llm = ScriptedChat([self.TIMEOUT() for _ in range(6)])
+        _, events = self.run_with(llm, max_continues=2)
+        self.assertEqual(len(llm.calls), 3)                      # original + 2 retries
+        self.assertEqual(len(self.kinds(events, "notice")), 2)
+        (error,) = self.kinds(events, "error")
+        self.assertIn("gave up", error)
+        self.assertIn("3 times in a row", error)
+
+    def test_a_successful_reply_resets_the_retry_count(self) -> None:
+        llm = ScriptedChat([self.TIMEOUT(), {"tool_calls": [tool_call("list_dir", {})]}, self.TIMEOUT(),
+                            {"content": "done"}])
+        _, events = self.run_with(llm, max_continues=1)
+        self.assertEqual(self.kinds(events, "assistant"), ["done"])
+        self.assertEqual(self.kinds(events, "error"), [])
+
+    def test_zero_means_retry_forever(self) -> None:
+        llm = ScriptedChat([self.TIMEOUT() for _ in range(12)] + [{"content": "finally"}])
+        _, events = self.run_with(llm, max_continues=0)
+        self.assertEqual(self.kinds(events, "assistant"), ["finally"])
+        self.assertIn("no limit", self.kinds(events, "notice")[0])
+
+    def test_retries_do_not_use_up_the_step_limit(self) -> None:
+        llm = ScriptedChat([self.TIMEOUT(), self.TIMEOUT(), self.TIMEOUT(), {"content": "ok"}])
+        _, events = self.run_with(llm, max_steps=2, max_continues=5)
+        self.assertEqual(self.kinds(events, "assistant"), ["ok"])
+        self.assertEqual(self.kinds(events, "error"), [])
+
+    def test_other_model_errors_are_not_retried(self) -> None:
+        llm = ScriptedChat([ai.LLMError("boom")])
+        with self.assertRaises(ai.LLMError):
+            self.run_with(llm)
+        self.assertEqual(len(llm.calls), 1)
+
+    # ---- live text events ----------------------------------------------------------
+    def test_live_text_events_end_before_the_final_reply(self) -> None:
+        def streams(messages, on_text, cancelled):
+            on_text("reasoning", "hm")
+            on_text("answer", "fin")
+            return {"content": "final"}
+
+        _, events = self.run_with(ScriptedChat([streams]))
+        order = [(k, t) for k, t in events if k.startswith("stream") or k == "assistant"]
+        self.assertEqual(order, [("stream_reasoning", "hm"), ("stream_answer", "fin"),
+                                 ("stream_end", ""), ("assistant", "final")])
+
+    def test_no_stream_end_when_nothing_was_streamed(self) -> None:
+        _, events = self.run_with(ScriptedChat([{"content": "plain"}]))
+        self.assertNotIn("stream_end", [k for k, _ in events])
+
+    # ---- stop -----------------------------------------------------------------------
+    def test_stop_aborts_the_reply_in_flight_and_ends_the_run(self) -> None:
+        entered, release = threading.Event(), threading.Event()
+
+        class Blocking(ScriptedChat):
+            def chat(self, messages, tools=None, progress=None, on_text=None, cancelled=None):
+                on_text("answer", "partial text")
+                entered.set()
+                release.wait(5)
+                raise ai.GenerationStopped()
+
+            def abort(self, reason="stopped"):
+                super().abort(reason)
+                release.set()
+
+        llm = Blocking([])
+        events: list[tuple[str, str]] = []
+        agent = ai.Agent(llm, self.tb)
+        t = threading.Thread(target=lambda: agent.run("go", lambda k, x: events.append((k, x)), lambda n, a: True), daemon=True)
+        t.start()
+        self.assertTrue(entered.wait(3))
+        agent.stop()
+        t.join(3)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(llm.abort_calls, ["stopped"])
+        self.assertIn(("stream_end", "aborted"), events)
+        self.assertEqual(self.kinds(events, "notice"), ["Stopped."])
+        self.assertEqual([m["role"] for m in agent.messages], ["system", "user"])  # partial reply discarded
+
+    def test_stop_kills_a_running_shell_command_and_cancels_the_rest(self) -> None:
+        llm = ScriptedChat([{"tool_calls": [tool_call("run_shell", {"command": "sleep 30"}, "c1"),
+                                            tool_call("list_dir", {}, "c2")]}])
+        events: list[tuple[str, str]] = []
+        agent = ai.Agent(llm, self.tb)
+        t0 = time.time()
+        t = threading.Thread(target=lambda: agent.run("go", lambda k, x: events.append((k, x)), lambda n, a: True), daemon=True)
+        t.start()
+        for _ in range(100):
+            if self.tb._proc is not None:
+                break
+            time.sleep(0.05)
+        self.assertIsNotNone(self.tb._proc, "the command never started")
+        agent.stop()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertLess(time.time() - t0, 10)   # not the 30s the command wanted
+        tool_msgs = {m["tool_call_id"]: m["content"] for m in agent.messages if m["role"] == "tool"}
+        self.assertTrue(tool_msgs["c1"].startswith("Stopped by the user"))
+        self.assertTrue(tool_msgs["c2"].startswith("Cancelled"))       # every call still has a result
+        self.assertEqual(self.kinds(events, "notice"), ["Stopped."])
+        self.assertIsNone(self.tb._proc)
+
+    def test_stop_before_a_run_does_not_cancel_the_next_run(self) -> None:
+        agent = ai.Agent(FakeLLM([{"content": "hello"}]), self.tb)
+        agent.stop()
+        self.assertTrue(agent.stopped())
+        events: list[tuple[str, str]] = []
+        agent.run("go", lambda k, t: events.append((k, t)), lambda n, a: True)
+        self.assertFalse(agent.stopped())
+        self.assertIn(("assistant", "hello"), events)
+
+    def test_stop_with_a_model_that_has_no_abort_method(self) -> None:
+        agent = ai.Agent(FakeLLM([]), self.tb)
+        agent.stop()   # must not raise
+        self.assertTrue(agent.stopped())
+
+    def test_add_continue(self) -> None:
+        agent = ai.Agent(FakeLLM([]), self.tb)
+        agent.messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "task"}]
+        agent._add_continue()
+        self.assertEqual(agent.messages[-1]["content"], "task\n\ncontinue")
+        agent._add_continue()
+        self.assertEqual(agent.messages[-1]["content"], "task\n\ncontinue\n\ncontinue")
+        agent.messages.append({"role": "tool", "tool_call_id": "1", "content": "r"})
+        agent._add_continue()
+        self.assertEqual(agent.messages[-1], {"role": "user", "content": "continue"})
+        self.assertEqual(len(agent.messages), 4)
+
+    def test_end_to_end_with_a_real_server_stuck_in_a_loop(self) -> None:
+        server = FakeLMServer(b_endless_loop, b_answer("recovered after continue"))
+        self.addCleanup(server.close)
+        llm = ai.LMStudio(server.url, "m", timeout=30, generation_timeout=0.6)
+        events: list[tuple[str, str]] = []
+        agent = ai.Agent(llm, self.tb)
+        t0 = time.time()
+        runner = threading.Thread(
+            target=lambda: agent.run("do the thing", lambda k, t: events.append((k, t)), lambda n, a: True), daemon=True)
+        runner.start()
+        runner.join(10)
+        self.assertFalse(runner.is_alive(), "the agent never got out of the stuck reply")
+        self.assertLess(time.time() - t0, 8)
+        self.assertEqual(self.kinds(events, "assistant"), ["recovered after continue"])
+        self.assertIn(("stream_end", "aborted"), events)
+        self.assertEqual(len(self.kinds(events, "notice")), 1)
+        second = server.requests[1]["messages"]
+        self.assertEqual(second[1], {"role": "user", "content": "do the thing\n\ncontinue"})
+        self.assertNotIn("the same words again", json.dumps(second))
+        self.assertTrue(server.disconnected.wait(3))   # the looping request was really hung up on
+
+
+class ShellKillTests(TempRootCase):
+    def test_kill_running_stops_a_long_command(self) -> None:
+        t0 = time.time()
+        out: dict = {}
+        t = threading.Thread(target=lambda: out.update(r=self.tb.run_shell("sleep 30")), daemon=True)
+        t.start()
+        for _ in range(100):
+            if self.tb._proc is not None:
+                break
+            time.sleep(0.05)
+        self.tb.kill_running()
+        t.join(5)
+        self.assertFalse(t.is_alive())
+        self.assertLess(time.time() - t0, 10)
+        self.assertTrue(out["r"].startswith("Stopped by the user"))
+
+    def test_kill_when_nothing_is_running_does_nothing(self) -> None:
+        self.tb.kill_running()
+        self.assertEqual(self.tb.run_shell("echo ok").split("\n")[1], "ok")   # the flag didn't stick
+
+    def test_a_kill_does_not_affect_the_next_command(self) -> None:
+        self.tb._killed = True   # stale flag
+        self.assertTrue(self.tb.run_shell("echo fine").startswith("exit code 0"))
+
+
+class TuiStopTests(unittest.IsolatedAsyncioTestCase):
+    def make_app(self, llm):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        return ai.AiApp(ai.Agent(llm, ai.Toolbox(self.root)))
+
+    async def until(self, pilot, cond, seconds=5.0) -> bool:
+        end = time.time() + seconds
+        while time.time() < end:
+            await pilot.pause(0.05)
+            if cond():
+                return True
+        return False
+
+    async def submit(self, app, pilot, text="go"):
+        app.query_one(ai.Input).value = text
+        await pilot.press("enter")
+
+    @staticmethod
+    def labels(app):
+        return [k.description for k in app.query("FooterKey")]
+
+    class Hanging(ScriptedChat):
+        """Streams some text, then hangs until aborted (like a model stuck in a loop)."""
+
+        def __init__(self, text="looping looping looping"):
+            super().__init__([])
+            self.text, self.entered, self.release = text, threading.Event(), threading.Event()
+
+        def chat(self, messages, tools=None, progress=None, on_text=None, cancelled=None):
+            if on_text:
+                on_text("answer", self.text)
+            self.entered.set()
+            self.release.wait(10)
+            raise ai.GenerationStopped()
+
+        def abort(self, reason="stopped"):
+            super().abort(reason)
+            self.release.set()
+
+    # ---- key bindings ----------------------------------------------------------------
+    async def test_footer_has_stop_and_no_new_chat(self) -> None:
+        app = self.make_app(FakeLLM([]))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            labels = self.labels(app)
+            self.assertIn("Stop", labels)
+            self.assertNotIn("New chat", labels)
+        keys = {b.key: b for b in ai.AiApp.BINDINGS}
+        self.assertNotIn("ctrl+l", keys)
+        self.assertEqual((keys["ctrl+k"].action, keys["ctrl+k"].description, keys["ctrl+k"].priority),
+                         ("stop", "Stop", True))
+
+    async def test_clear_command_still_works_without_a_key(self) -> None:
+        app = self.make_app(FakeLLM([]))
+        async with app.run_test() as pilot:
+            app._write(ai.Text("something"))
+            await pilot.pause()
+            await self.submit(app, pilot, "/clear")
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(transcript_text(app), "Conversation cleared.")
+
+    async def test_stop_is_disabled_when_idle_and_ctrl_k_stays_the_prompts_own_key(self) -> None:
+        app = self.make_app(FakeLLM([]))
+        async with app.run_test() as pilot:
+            self.assertIsNone(app.check_action("stop", ()))
+            prompt = app.query_one(ai.Input)
+            prompt.value = "hello world"
+            prompt.cursor_position = 5
+            await pilot.press("ctrl+k")
+            self.assertEqual(prompt.value, "hello")      # Input's delete-to-end, not "stop"
+
+    async def test_stop_is_enabled_while_the_agent_is_working(self) -> None:
+        llm = self.Hanging()
+        app = self.make_app(llm)
+        async with app.run_test() as pilot:
+            await self.submit(app, pilot)
+            self.assertTrue(await self.until(pilot, lambda: llm.entered.is_set()))
+            self.assertTrue(app.check_action("stop", ()))
+            await pilot.press("ctrl+k")
+            self.assertTrue(await self.until(pilot, lambda: not app.busy))
+            self.assertIsNone(app.check_action("stop", ()))
+
+    # ---- stopping ---------------------------------------------------------------------
+    async def test_ctrl_k_stops_a_generation_and_keeps_what_was_streamed(self) -> None:
+        llm = self.Hanging("looping looping looping")
+        app = self.make_app(llm)
+        async with app.run_test() as pilot:
+            await self.submit(app, pilot)
+            self.assertTrue(await self.until(pilot, lambda: llm.entered.is_set()))
+            await pilot.pause(0.3)
+            await pilot.press("ctrl+k")
+            self.assertTrue(await self.until(pilot, lambda: not app.busy), "the app is still busy after ctrl+k")
+            self.assertEqual(llm.abort_calls, ["stopped"])
+            text = transcript_text(app)
+            self.assertIn("looping looping looping", text)   # you can see what it was doing
+            self.assertIn("Stopped.", text)
+            self.assertFalse(app.query_one(ai.ActivityPanel).display)
+            await self.submit(app, pilot, "next")            # and you can go on with the conversation
+            self.assertTrue(await self.until(pilot, lambda: llm.entered.is_set()))
+
+    async def test_ctrl_k_while_the_approval_prompt_is_open(self) -> None:
+        llm = ScriptedChat([{"tool_calls": [tool_call("write_file", {"path": "n.txt", "content": "hi"})]},
+                            {"content": "never reached"}])
+        app = self.make_app(llm)
+        async with app.run_test() as pilot:
+            await self.submit(app, pilot)
+            self.assertTrue(await self.until(pilot, lambda: isinstance(app.screen, ai.ApprovalScreen)))
+            await pilot.press("ctrl+k")
+            self.assertTrue(await self.until(pilot, lambda: not app.busy))
+            self.assertNotIsInstance(app.screen, ai.ApprovalScreen)
+            self.assertFalse((self.root / "n.txt").exists())
+            self.assertIn("Stopped.", transcript_text(app))
+            self.assertEqual(len(llm.calls), 1)               # the run really ended
+
+    async def test_a_pending_approval_gives_up_when_the_agent_is_stopped(self) -> None:
+        app = self.make_app(FakeLLM([]))
+        result = {}
+        async with app.run_test():                      # the app is running, so only the stop can end the wait
+            with mock.patch.object(app, "call_from_thread"):
+                thread = threading.Thread(target=lambda: result.update(ok=app._approve("write_file", {})), daemon=True)
+                thread.start()
+                await asyncio.sleep(0.5)
+                self.assertTrue(thread.is_alive())      # still waiting for an answer
+                app.agent.stop()
+                await asyncio.get_running_loop().run_in_executor(None, thread.join, 3)
+            self.assertFalse(thread.is_alive())
+            self.assertIs(result.get("ok"), False)
+
+    async def test_ctrl_k_kills_a_running_command(self) -> None:
+        llm = ScriptedChat([{"tool_calls": [tool_call("run_shell", {"command": "sleep 30"})]}])
+        app = self.make_app(llm)
+        async with app.run_test() as pilot:
+            await pilot.press("ctrl+s")                      # supervision off: no approval prompt
+            await self.submit(app, pilot)
+            self.assertTrue(await self.until(pilot, lambda: app.agent.toolbox._proc is not None))
+            await pilot.press("ctrl+k")
+            self.assertTrue(await self.until(pilot, lambda: not app.busy, 8))
+            self.assertIn("Stopped.", transcript_text(app))
+
+    # ---- live text ---------------------------------------------------------------------
+    class Streaming(GatedLLM):
+        def chat(self, messages, tools=None, progress=None, on_text=None, cancelled=None):
+            if on_text:
+                on_text("reasoning", "pondering the question")
+                on_text("answer", "partial reply so far")
+                on_text("tool", 'write_file {"path": "a.txt", "con')
+            return super().chat(messages, tools, progress, on_text, cancelled)
+
+    @staticmethod
+    def live_texts(app):
+        return {w.content.plain if hasattr(w.content, "plain") else str(w.content)
+                for w in app.query_one(ai.Transcript).query(".live")}
+
+    async def test_streamed_text_appears_in_the_transcript_while_it_is_generated(self) -> None:
+        gate = threading.Event()
+        app = self.make_app(self.Streaming([{"content": "final answer"}], gate))
+        async with app.run_test() as pilot:
+            await self.submit(app, pilot)
+            self.assertTrue(await self.until(pilot, lambda: len(self.live_texts(app)) == 3))
+            self.assertEqual(self.live_texts(app), {"pondering the question", "partial reply so far",
+                                                    'write_file {"path": "a.txt", "con'})
+            gate.set()
+            self.assertTrue(await self.until(pilot, lambda: not app.busy))
+            await pilot.pause(0.3)
+            # finished: reasoning stays, the live answer/tool text is replaced by the real reply
+            self.assertEqual(self.live_texts(app), {"pondering the question"})
+            entries = app.query_one(ai.Transcript).entries
+            self.assertEqual(entries[-2:], ["pondering the question", "final answer"])
+            self.assertNotIn("partial reply so far", transcript_text(app))
+
+    async def test_the_live_block_grows_in_place(self) -> None:
+        app = self.make_app(FakeLLM([]))
+        async with app.run_test() as pilot:
+            log = app.query_one(ai.Transcript)
+            for text in ("a", "ab", "abc"):
+                log.stream("answer", text)
+                await pilot.pause()
+            self.assertEqual(self.live_texts(app), {"abc"})
+            self.assertEqual(len(log.query(".live")), 1)
+
+    async def test_only_the_newest_text_of_a_huge_stream_is_shown(self) -> None:
+        app = self.make_app(FakeLLM([]))
+        async with app.run_test() as pilot:
+            log = app.query_one(ai.Transcript)
+            log.stream("answer", "A" * 20000 + "THE END")
+            await pilot.pause()
+            (shown,) = self.live_texts(app)
+            self.assertLess(len(shown), ai.LIVE_MAX_CHARS + 100)
+            self.assertIn("earlier chars not shown", shown)
+            self.assertTrue(shown.endswith("THE END"))
+
+    async def test_streamed_text_from_a_failed_request_is_not_lost(self) -> None:
+        def dies(messages, on_text, cancelled):
+            on_text("answer", "half a reply")
+            raise ai.LLMError("connection dropped")
+
+        app = self.make_app(ScriptedChat([dies]))
+        async with app.run_test() as pilot:
+            await self.submit(app, pilot)
+            self.assertTrue(await self.until(pilot, lambda: not app.busy))
+            text = transcript_text(app)
+            self.assertIn("half a reply", text)
+            self.assertIn("connection dropped", text)
+            self.assertEqual(self.live_texts(app), {"half a reply"})
+
+    async def test_generation_timeout_retry_is_visible_in_the_transcript(self) -> None:
+        def loops(messages, on_text, cancelled):
+            on_text("answer", "round and round")
+            raise ai.GenerationTimeout(600)
+
+        llm = ScriptedChat([loops, {"content": "back on track"}])
+        app = self.make_app(llm)
+        async with app.run_test() as pilot:
+            await self.submit(app, pilot)
+            self.assertTrue(await self.until(pilot, lambda: not app.busy))
+            await pilot.pause(0.3)
+            text = transcript_text(app)
+            for part in ("round and round", "stopped", 'Sent "continue"', "back on track"):
+                self.assertIn(part, text)
+            self.assertEqual(llm.calls[1][-1]["content"], "go\n\ncontinue")
+
+    async def test_reset_forgets_live_blocks(self) -> None:
+        app = self.make_app(FakeLLM([]))
+        async with app.run_test() as pilot:
+            log = app.query_one(ai.Transcript)
+            log.stream("answer", "x")
+            await pilot.pause()
+            log.reset()
+            await pilot.pause()
+            self.assertEqual((log.entries, log._live, len(log.children)), ([], {}, 0))
+
+
+class StopAndRetryOptionTests(unittest.TestCase):
+    def run_main(self, argv, env=None):
+        with mock.patch.object(sys, "argv", ["ai"] + argv), \
+                mock.patch.dict("os.environ", env or {}, clear=False), \
+                mock.patch.object(ai, "_reattach_tty"), \
+                mock.patch.object(ai, "AiApp"), \
+                mock.patch.object(ai, "Agent") as agent_cls:
+            ai.main()
+        return agent_cls.call_args
+
+    def test_defaults(self) -> None:
+        with mock.patch.dict("os.environ"):
+            for var in ("AI_GENERATION_TIMEOUT", "AI_MAX_CONTINUES", "AI_TIMEOUT"):
+                os.environ.pop(var, None)
+            call = self.run_main([])
+        self.assertEqual(call.args[0].generation_timeout, 600.0)
+        self.assertEqual(call.kwargs["max_continues"], 5)
+
+    def test_flags(self) -> None:
+        call = self.run_main(["--generation-timeout", "120", "--max-continues", "2"])
+        self.assertEqual(call.args[0].generation_timeout, 120.0)
+        self.assertEqual(call.kwargs["max_continues"], 2)
+
+    def test_environment_variables_and_flag_precedence(self) -> None:
+        env = {"AI_GENERATION_TIMEOUT": "300", "AI_MAX_CONTINUES": "9"}
+        call = self.run_main([], env)
+        self.assertEqual((call.args[0].generation_timeout, call.kwargs["max_continues"]), (300.0, 9))
+        call = self.run_main(["--generation-timeout", "60", "--max-continues", "1"], env)
+        self.assertEqual((call.args[0].generation_timeout, call.kwargs["max_continues"]), (60.0, 1))
+
+    def test_zero_turns_both_limits_off(self) -> None:
+        call = self.run_main(["--generation-timeout", "0", "--max-continues", "0"])
+        self.assertEqual(call.args[0].generation_timeout, 0)
+        self.assertEqual(call.kwargs["max_continues"], 0)
+
+    def test_the_idle_timeout_is_independent(self) -> None:
+        call = self.run_main(["--timeout", "42", "--generation-timeout", "7"])
+        self.assertEqual((call.args[0].timeout, call.args[0].generation_timeout), (42.0, 7.0))
 
 
 if __name__ == "__main__":

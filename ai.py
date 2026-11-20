@@ -14,10 +14,13 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
+import uuid
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 from dataclasses import dataclass, replace as dataclass_replace
 from pathlib import Path
@@ -27,6 +30,11 @@ from typing import Callable
 # Bootstrap: make sure textual + httpx are importable without touching the
 # system Python (pip --target into a private cache dir).
 # --------------------------------------------------------------------------
+try:
+    import fcntl  # POSIX: lets a session log be locked against a second ai process
+except ImportError:
+    fcntl = None
+
 HOME = Path(os.getenv("AI_HOME") or Path.home() / ".cache" / "ai")
 DEPS = HOME / "deps"
 
@@ -69,7 +77,24 @@ class LLMError(Exception):
     pass
 
 
-DEFAULT_TIMEOUT = 600.0
+ELLIPSIS = "\u2026"
+DEFAULT_TIMEOUT = 600.0             # longest we wait for LM Studio to send *any* data
+DEFAULT_GENERATION_TIMEOUT = 600.0  # longest a single reply may run before it is stopped (breaks output loops)
+
+
+class GenerationStopped(LLMError):
+    """The user pressed stop."""
+
+    def __init__(self, message: str = "Stopped."):
+        super().__init__(message)
+
+
+class GenerationTimeout(LLMError):
+    """One reply ran longer than the generation limit (typically a model stuck repeating itself)."""
+
+    def __init__(self, seconds: float):
+        super().__init__(f"The model was still generating after {format_elapsed(seconds)}; it was stopped.")
+        self.seconds = seconds
 
 
 def _stream_detail(name: str, args_text: str) -> str:
@@ -89,14 +114,27 @@ def _stream_detail(name: str, args_text: str) -> str:
 
 class LMStudio:
     def __init__(self, base_url: str = "http://localhost:1234/v1", model: str | None = None,
-                 timeout: float = DEFAULT_TIMEOUT):
+                 timeout: float = DEFAULT_TIMEOUT, generation_timeout: float | None = DEFAULT_GENERATION_TIMEOUT):
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.timeout = timeout
         # Replies are streamed, so `timeout` is the longest we wait for *any* data, not for the whole
-        # reply: a slow model that keeps producing tokens never trips it. It only fires if the server
-        # goes completely silent (e.g. while ingesting a huge prompt before the first token).
-        self.http = httpx.Client(timeout=httpx.Timeout(timeout, connect=5.0))
+        # reply. `generation_timeout` is the longest a whole reply may take (0/None = no limit): it
+        # stops a model that keeps producing tokens forever, e.g. stuck repeating itself.
+        self.timeout = timeout
+        self.generation_timeout = generation_timeout or 0
+        self._lock = threading.Lock()
+        self._active = False          # a chat() call is in flight
+        self._response = None         # its streaming response, once headers arrived
+        self._abort_reason: str | None = None
+        self._stale_client = False    # the client was closed to abort a request and must be rebuilt
+        self.http = self._new_client()
+
+    def _new_client(self) -> httpx.Client:
+        return httpx.Client(timeout=httpx.Timeout(self.timeout, connect=5.0))
+
+    def _ensure_client(self) -> None:
+        if self._stale_client:
+            self.http, self._stale_client = self._new_client(), False
 
     def _translate(self, e: httpx.HTTPError) -> LLMError:
         if isinstance(e, httpx.ConnectError):
@@ -116,6 +154,7 @@ class LMStudio:
         return LLMError(str(e) or type(e).__name__)
 
     def _request(self, method: str, path: str, **kw) -> dict:
+        self._ensure_client()
         try:
             r = self.http.request(method, self.base_url + path, **kw)
             r.raise_for_status()
@@ -134,16 +173,76 @@ class LMStudio:
             self.model = models[0]
         return self.model
 
+    def _shutdown_connections(self) -> None:
+        """Make a blocked read return *now*. Closing a socket from another thread doesn't wake a thread
+        that is blocked reading it; shutting it down does (and tells LM Studio to stop generating).
+        Reaches into httpcore's pool, so it quietly does nothing if those internals ever change."""
+        try:
+            for conn in self.http._transport._pool.connections:
+                sock = conn._connection._network_stream.get_extra_info("socket")
+                if sock is not None:
+                    sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+
+    def abort(self, reason: str = "stopped") -> None:
+        """Abort the reply being generated (safe to call from any thread; a no-op when idle).
+        Closing the connection is what makes LM Studio stop generating."""
+        with self._lock:
+            if not self._active:
+                return
+            self._abort_reason = self._abort_reason or reason
+            response = self._response
+        self._shutdown_connections()
+        if response is not None:
+            try:
+                response.close()
+            except Exception:
+                pass
+        else:  # still connecting / waiting for the first byte: tear the connection pool down
+            self._stale_client = True
+            try:
+                self.http.close()
+            except Exception:
+                pass
+
+    def _aborted(self, reason: str) -> LLMError:
+        return GenerationTimeout(self.generation_timeout) if reason == "timeout" else GenerationStopped()
+
     def chat(self, messages: list[dict], tools: list[dict] | None = None,
-             progress: Callable[[str, str], None] | None = None) -> dict:
+             progress: Callable[[str, str], None] | None = None,
+             on_text: Callable[[str, str], None] | None = None,
+             cancelled: Callable[[], bool] | None = None) -> dict:
         """Send the whole conversation and stream the reply. Returns the assistant message
         ({"content", optional "tool_calls", "reasoning_content", "finish_reason"}).
-        `progress(label, detail)` is called (throttled) while the reply is being generated."""
+
+        progress(label, detail): throttled status while the reply is generated.
+        on_text(channel, text_so_far): throttled live text; channel is "reasoning", "answer" or "tool".
+        cancelled(): polled; when true the request is dropped and GenerationStopped is raised.
+        Raises GenerationTimeout if the reply takes longer than generation_timeout."""
         body = {"model": self.ensure_model(), "messages": messages, "temperature": 0.2, "stream": True}
         if tools:
             body["tools"] = tools
+        with self._lock:
+            self._ensure_client()
+            self._active, self._response, self._abort_reason = True, None, None
+        watchdog = None
+        if self.generation_timeout:
+            watchdog = threading.Timer(self.generation_timeout, self.abort, args=("timeout",))
+            watchdog.daemon = True
+            watchdog.start()
+
+        def check() -> None:
+            reason = self._abort_reason or ("stopped" if cancelled and cancelled() else None)
+            if reason:
+                raise self._aborted(reason)
+
         try:
+            check()
             with self.http.stream("POST", self.base_url + "/chat/completions", json=body) as r:
+                with self._lock:
+                    self._response = r
+                check()
                 if r.status_code >= 400:
                     r.read()
                     raise LLMError(f"LM Studio returned {r.status_code}: {r.text[:500]}")
@@ -158,33 +257,65 @@ class LMStudio:
                         return data["choices"][0]["message"]
                     except (KeyError, IndexError, TypeError):
                         raise LLMError(f"Unexpected response: {str(data)[:500]}")
-                return self._consume(r.iter_lines(), progress)
-        except httpx.HTTPError as e:
-            raise self._translate(e)
+                msg = self._consume(r.iter_lines(), progress, on_text, check)
+                with self._lock:
+                    self._active = False  # finished: a late watchdog must not turn this into a timeout
+                return msg
+        except Exception as e:
+            if self._abort_reason:  # closing a stream under a blocked read surfaces as assorted errors
+                raise self._aborted(self._abort_reason) from None
+            if isinstance(e, httpx.HTTPError):
+                raise self._translate(e) from None
+            raise
+        finally:
+            if watchdog:
+                watchdog.cancel()
+            with self._lock:
+                self._active, self._response = False, None
 
     @staticmethod
-    def _consume(lines, progress) -> dict:
-        """Assemble a message from server-sent-event lines (OpenAI streaming format)."""
+    def _consume(lines, progress, on_text=None, aborted=None) -> dict:
+        """Assemble a message from server-sent-event lines (OpenAI streaming format).
+        `aborted()` is called per line and raises to abandon the stream."""
         content: list[str] = []
         reasoning: list[str] = []
         calls: dict[int, dict] = {}
         finish = None
         state = {"label": "", "t": 0.0}
+        text_state = {"t": float("-inf")}
+        sent = {"reasoning": 0, "answer": 0, "tool": 0}
 
-        def report(label: str, detail: str) -> None:
+        def report(label: str, detail: str, now: float) -> None:
             if not progress:
                 return
-            now = time.monotonic()
             if label != state["label"] or now - state["t"] >= 0.15:  # label changes always get through
                 state["label"], state["t"] = label, now
                 progress(label, detail)
 
+        def flush(now: float, force: bool = False) -> None:
+            """Push the text generated so far to the UI, at most ~10 times a second."""
+            if not on_text or (not force and now - text_state["t"] < 0.1):
+                return
+            text_state["t"] = now
+            texts = {
+                "reasoning": "".join(reasoning),
+                "answer": "".join(content),
+                "tool": "\n".join(f"{c['name'] or ELLIPSIS} {c['args']}" for _, c in sorted(calls.items())),
+            }
+            for channel, text in texts.items():
+                if len(text) != sent[channel]:
+                    sent[channel] = len(text)
+                    on_text(channel, text)
+
         last_idx = -1
         n_content = n_reasoning = 0
         for raw in lines:
+            if aborted:
+                aborted()
             line = raw.strip()
             if not line.startswith("data:"):
                 continue  # blank lines, ": keep-alive" comments, event:/id: fields
+            now = time.monotonic()
             line = line[5:].strip()
             if line == "[DONE]":
                 break
@@ -204,13 +335,13 @@ class LMStudio:
                 if isinstance(r_text, str) and r_text:
                     reasoning.append(r_text)
                     n_reasoning += len(r_text)
-                    report("Reasoning", f"{n_reasoning:,} chars")
+                    report("Reasoning", f"{n_reasoning:,} chars", now)
 
                 c_text = delta.get("content")
                 if isinstance(c_text, str) and c_text:
                     content.append(c_text)
                     n_content += len(c_text)
-                    report("Writing a reply", f"{n_content:,} chars")
+                    report("Writing a reply", f"{n_content:,} chars", now)
 
                 for tc in delta.get("tool_calls") or []:
                     idx = tc.get("index")
@@ -235,7 +366,9 @@ class LMStudio:
                     if isinstance(args, str):
                         entry["args"] += args
                     label = f"Composing {entry['name']}" if entry["name"] else "Composing a tool call"
-                    report(label, _stream_detail(entry["name"], entry["args"]))
+                    report(label, _stream_detail(entry["name"], entry["args"]), now)
+            flush(now)
+        flush(time.monotonic(), force=True)
 
         msg: dict = {"role": "assistant", "content": "".join(content)}
         if reasoning:
@@ -393,6 +526,10 @@ def _command_start(words: list[str]) -> list[str]:
             k += 1
         return rest[k:]
     return words[i:]
+
+
+def _is_session_file(p: Path) -> bool:
+    return p.name.startswith(SESSION_PREFIX)
 
 
 def _resolve_in_root(arg: str, root: Path) -> tuple[Path | None, str | None]:
@@ -710,9 +847,11 @@ def _check_words(sep: str, prev_cmd: str, words: list[str], root: Path, depth: i
         if t in REDIRECTS:
             if target == "/dev/null" or (t == ">&" and (target.isdigit() or target == "-")):
                 continue
-            _, err = _resolve_in_root(target, root)
+            p, err = _resolve_in_root(target, root)
             if err:
                 return f"redirect target: {err}"
+            if _is_session_file(p):
+                return f"redirect target: {p.name} is the session log managed by ai"
         elif t == "<" and target != "/dev/null":
             p, err = _resolve_in_root(target, root)
             if err:
@@ -788,6 +927,8 @@ def _check_words(sep: str, prev_cmd: str, words: list[str], root: Path, depth: i
                     return f"{cmd}: {err}"
                 if cmd in DESTRUCTIVE and (p == root or p.is_relative_to(root / ".git")):
                     return f"{cmd}: refusing to modify the workspace root or .git"
+                if _is_session_file(p):
+                    return f"{cmd}: {p.name} is the session log managed by ai"
     if cmd == "dd":
         for a in args:
             if a.startswith(("of=", "if=")):
@@ -806,6 +947,13 @@ def _check_words(sep: str, prev_cmd: str, words: list[str], root: Path, depth: i
             reason = _check_read_path(cmd, a, root)
             if reason:
                 return reason
+    if cmd == "sed":  # sed -i edits files in place
+        s_opts, s_pos = _getopt(args, short_val="ef", long_val=_READER_LONG_VALUES, short_opt="i")
+        if any(n == "-i" or n.startswith("--in-place") for n, _ in s_opts):
+            for a in s_pos:
+                p, _ = _resolve_in_root(a, root)
+                if p is not None and _is_session_file(p):
+                    return f"sed: {p.name} is the session log managed by ai"
     if cmd in NETWORK_GET:
         reason = _check_fetch(cmd, args, root)
         if reason:
@@ -890,6 +1038,9 @@ class Toolbox:
     def __init__(self, root: Path):
         self.root = root.resolve()
         self.downloaded: set[Path] = set()  # files created by curl/wget in this session; never executed
+        self.protected: set[Path] = set()  # files the tools must never modify (the session log)
+        self._proc: subprocess.Popen | None = None  # the run_shell command currently running, if any
+        self._killed = False
         self.tools: dict[str, Tool] = {t.name: t for t in self._build()}
 
     def schemas(self) -> list[dict]:
@@ -951,14 +1102,23 @@ class Toolbox:
             text += f"... [showing lines {start}-{i - 1} of {total}; end of file]"
         return text
 
+    def protect(self, path) -> None:
+        self.protected.add(Path(path).resolve())
+
+    def _check_writable(self, p: Path) -> None:
+        if p.name.startswith(SESSION_PREFIX) or p in self.protected:
+            raise ValueError(f"{p.name} is the session log managed by ai; tools can't modify it")
+
     def write_file(self, path: str, content: str) -> str:
         p = self._path(path)
+        self._check_writable(p)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
         return f"Wrote {len(content)} chars to {path}"
 
     def edit_file(self, path: str, old: str, new: str) -> str:
         p = self._path(path)
+        self._check_writable(p)
         text = p.read_text()
         n = text.count(old)
         if n == 0:
@@ -973,6 +1133,8 @@ class Toolbox:
         files = [base] if base.is_file() else base.rglob("*")
         for f in files:
             if not f.is_file() or any(part in SKIP_DIRS for part in f.parts):
+                continue
+            if f.name.startswith(SESSION_PREFIX) and f != base:  # our own logs just repeat everything else
                 continue
             try:
                 for i, line in enumerate(f.read_text().splitlines(), 1):
@@ -996,13 +1158,29 @@ class Toolbox:
             command, shell=True, cwd=self.root, env=_clean_env(), stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
         )
+        self._proc, self._killed = proc, False
         try:
             out, err = proc.communicate(timeout=120)
         except subprocess.TimeoutExpired:
             os.killpg(proc.pid, signal.SIGKILL)  # kill the whole process group, not just the shell
             proc.communicate()
             return "Error: command timed out after 120s and was killed"
+        finally:
+            self._proc = None
+        if self._killed:
+            self._killed = False
+            return "Stopped by the user: the command was killed."
         return f"exit code {proc.returncode}\n{out}{err}"
+
+    def kill_running(self) -> None:
+        """Kill the run_shell command that is running right now (called when the user presses stop)."""
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            self._killed = True
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
 
     def _build(self) -> list[Tool]:
         s = {"type": "string"}
@@ -1024,6 +1202,212 @@ class Toolbox:
                  _params({"command": s}, ["command"]), self.run_shell, dangerous=True,
                  validate=self._validate_shell),
         ]
+
+
+# --------------------------------------------------------------------------
+# Session log: an append-only record of the conversation so it can be resumed
+# --------------------------------------------------------------------------
+SESSION_FILE = ".ai-session.jsonl"   # lives in the project root
+SESSION_PREFIX = ".ai-session"       # tools refuse to modify any file with this prefix (logs and archives)
+SESSION_VERSION = 1
+LOGGED_KINDS = {"assistant", "tool", "result", "error", "notice"}  # transcript events worth keeping
+LOG_REASONING_CHARS = 8000           # the model's reasoning is logged, but only its last part
+REPLAY_MAX = 200                     # on resume, show at most this many past entries on screen
+
+
+class SessionLocked(Exception):
+    """Another ai process is using this session log."""
+
+
+class SessionVersionError(Exception):
+    """The log was written by a newer ai than this one."""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class SessionLog:
+    """Append-only JSON-lines record of one session. One JSON object per line:
+
+      {"v":1,"type":"session","id":...,"created":...,"root":...}      header, first line
+      {"type":"message","ts":...,"message":{...}}                      one chat message (what the model sees)
+      {"type":"update_last","ts":...,"content":...}                    the last user message was extended
+      {"type":"transcript","ts":...,"kind":"user|assistant|tool|result|error|notice|reasoning","text":...}
+      {"type":"event","ts":...,"name":...,...}                         e.g. supervision toggled, resumed
+
+    Every record is flushed and fsynced as it is written, so killing ai at any moment loses at most a
+    half-written last line, which loading ignores. The file is created on the first record (opening ai
+    and quitting leaves nothing behind) and is flock'ed while open, so two ai processes can't interleave
+    writes. Failures to write never raise: they set `error` and the agent carries on."""
+
+    def __init__(self, path, root=None):
+        self.path = Path(path)
+        self.root = Path(root) if root else None
+        self.id = uuid.uuid4().hex[:12]
+        self.error: str | None = None
+        self._fh = None
+        self._lock = threading.Lock()
+
+    # ---- file handling ---------------------------------------------------------
+    def exists(self) -> bool:
+        try:
+            return self.path.stat().st_size > 0
+        except OSError:
+            return False
+
+    def _write(self, record: dict) -> None:
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        self._fh.write(line.encode("utf-8"))
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+    def _open(self) -> None:  # call with self._lock held
+        if self._fh is not None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.path, "a+b")
+        try:
+            if fcntl:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            raise SessionLocked(f"{self.path} is in use by another ai process")
+        self._fh = fh
+        if fh.seek(0, os.SEEK_END) == 0:
+            self._write({"v": SESSION_VERSION, "type": "session", "id": self.id, "created": _now(),
+                         "root": str(self.root) if self.root else None})
+        else:
+            fh.seek(-1, os.SEEK_END)
+            if fh.read(1) != b"\n":  # a previous run died mid-line: don't glue the next record onto it
+                fh.write(b"\n")
+                fh.flush()
+
+    def _close(self) -> None:
+        if self._fh is not None:
+            try:
+                self._fh.close()  # also releases the lock
+            finally:
+                self._fh = None
+
+    def open(self) -> None:
+        """Take the lock on an existing log (raises SessionLocked if another ai has it)."""
+        with self._lock:
+            self._open()
+
+    def close(self) -> None:
+        with self._lock:
+            self._close()
+
+    def append(self, type_: str, **fields) -> None:
+        with self._lock:
+            try:
+                self._open()
+                self._write({"type": type_, "ts": _now(), **fields})
+            except SessionLocked as e:
+                self.error = str(e)
+            except OSError as e:
+                self.error = f"can't write {self.path}: {e}"
+
+    # ---- records -----------------------------------------------------------------
+    def message(self, message: dict) -> None:
+        self.append("message", message=message)
+
+    def update_last(self, content: str) -> None:
+        self.append("update_last", content=content)
+
+    def transcript(self, kind: str, text: str) -> None:
+        self.append("transcript", kind=kind, text=text)
+
+    def event(self, name: str, **data) -> None:
+        self.append("event", name=name, **data)
+
+    # ---- reading / starting over ---------------------------------------------------
+    def load(self) -> tuple[list[dict], int]:
+        """All readable records, and how many lines were unreadable (e.g. a torn last line)."""
+        records: list[dict] = []
+        skipped = 0
+        with open(self.path, "rb") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line.decode("utf-8"))
+                except ValueError:
+                    skipped += 1
+                    continue
+                if isinstance(rec, dict):
+                    records.append(rec)
+                else:
+                    skipped += 1
+        header = next((r for r in records if r.get("type") == "session"), None)
+        if header:
+            if header.get("v", 1) > SESSION_VERSION:
+                raise SessionVersionError(
+                    f"{self.path} was written by a newer ai (log version {header['v']}, this one reads "
+                    f"{SESSION_VERSION}); use --new to start fresh or --session FILE for another log")
+            self.id = header.get("id", self.id)
+        return records, skipped
+
+    def archive(self) -> Path | None:
+        """Move the current log aside (never delete it) so the next record starts a fresh session."""
+        with self._lock:
+            if not self.exists():
+                self._close()
+                return None
+            self._open()  # take the lock first: never move a log that another ai is writing
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            dest = self.path.with_name(f"{self.path.stem}.{stamp}{self.path.suffix}")
+            n = 1
+            while dest.exists():
+                dest = self.path.with_name(f"{self.path.stem}.{stamp}-{n}{self.path.suffix}")
+                n += 1
+            os.replace(self.path, dest)
+            self._close()
+            self.id = uuid.uuid4().hex[:12]
+            return dest
+
+
+@dataclass
+class ResumeInfo:
+    transcript: list[dict]   # past visible entries, for redrawing the screen
+    notes: list[str]         # things the user should know (e.g. the last run was interrupted)
+    created: str
+    messages: int
+    path: Path
+
+
+def restore_history(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Rebuild (chat messages, transcript entries) from log records. The system message is not logged:
+    it is regenerated, so a newer ai gets its newer instructions."""
+    messages: list[dict] = []
+    transcript: list[dict] = []
+    for rec in records:
+        kind = rec.get("type")
+        if kind == "message" and isinstance(rec.get("message"), dict):
+            messages.append(rec["message"])
+        elif kind == "update_last" and messages and messages[-1].get("role") == "user":
+            messages[-1]["content"] = str(rec.get("content", ""))
+        elif kind == "transcript":
+            transcript.append(rec)
+    return messages, transcript
+
+
+def repair_interrupted_tool_calls(messages: list[dict]) -> list[dict]:
+    """If ai was closed while tool calls were running, the log ends with an assistant message whose calls
+    have no (or only some) results. A model API rejects that history, so return stand-in results for the
+    missing ones (the caller appends them)."""
+    i = len(messages) - 1
+    while i >= 0 and messages[i].get("role") == "tool":
+        i -= 1
+    if i < 0 or messages[i].get("role") != "assistant" or not messages[i].get("tool_calls"):
+        return []
+    answered = {m.get("tool_call_id") for m in messages[i + 1:]}
+    return [{"role": "tool", "tool_call_id": c.get("id", ""),
+             "content": "Interrupted: ai was closed before this tool call finished. It may or may not have "
+                        "completed; check before repeating it."}
+            for c in messages[i]["tool_calls"] if c.get("id", "") not in answered]
 
 
 # --------------------------------------------------------------------------
@@ -1101,28 +1485,125 @@ def format_elapsed(seconds: float) -> str:
 
 
 class Agent:
-    def __init__(self, llm: LMStudio, toolbox: Toolbox, max_steps: int = 25):
+    def __init__(self, llm: LMStudio, toolbox: Toolbox, max_steps: int = 25, max_continues: int = 5,
+                 session: SessionLog | None = None):
         self.llm, self.toolbox, self.max_steps = llm, toolbox, max_steps
+        self.session = session  # if set, everything is recorded so the conversation can be resumed
+        self.max_continues = max_continues  # consecutive generation timeouts we retry (0 = no limit)
+        self._stopped = threading.Event()
         self.messages: list[dict] = []
         self.reset()
 
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": SYSTEM.format(root=self.toolbox.root)}]
 
+    # ---- history + session log ---------------------------------------------------------
+    def _append(self, message: dict) -> None:
+        self.messages.append(message)
+        if self.session:
+            self.session.message(message)
+
+    def _update_last_user(self, content: str) -> None:
+        self.messages[-1]["content"] = content
+        if self.session:
+            self.session.update_last(content)
+
+    def _logging(self, emit: Emit) -> Emit:
+        if not self.session:
+            return emit
+
+        def logged(kind: str, text: str) -> None:
+            if kind in LOGGED_KINDS:
+                self.session.transcript(kind, text)
+            emit(kind, text)
+
+        return logged
+
+    def start_new_session(self) -> Path | None:
+        """Forget the conversation. The old log is moved aside (not deleted); returns where it went."""
+        self.reset()
+        return self.session.archive() if self.session else None
+
+    def resume(self) -> ResumeInfo | None:
+        """Restore the conversation from the session log, if there is one. Raises SessionLocked if another
+        ai process is using it. If ai was closed mid-run, the history is repaired so it is valid again."""
+        if self.session is None or not self.session.exists():
+            return None
+        self.session.open()
+        records, skipped = self.session.load()
+        messages, transcript = restore_history(records)
+        self.reset()
+        self.messages.extend(messages)
+        repairs = repair_interrupted_tool_calls(self.messages)
+        for r in repairs:
+            self._append(r)
+        last = self.messages[-1]["role"]
+        notes: list[str] = []
+        if repairs:
+            notes.append(f"{len(repairs)} tool call(s) were still running when ai was closed; the model "
+                         "has been told they may not have finished.")
+        elif last == "user":
+            notes.append("The previous run was interrupted before the model replied.")
+        elif last == "tool":
+            notes.append("The previous run was interrupted before the model could react to the last tool result.")
+        if last in ("user", "tool"):
+            notes.append('Type "continue" to pick up where it left off.')
+        if skipped:
+            notes.append(f"{skipped} unreadable line(s) in the session log were skipped.")
+        self.session.event("resumed", messages=len(messages), repaired=len(repairs))
+        header = next((r for r in records if r.get("type") == "session"), {})
+        return ResumeInfo(transcript, notes, header.get("created", "?"), len(messages), self.session.path)
+
+    def stopped(self) -> bool:
+        return self._stopped.is_set()
+
+    def stop(self) -> None:
+        """End the current run now (called from the UI thread). Aborts the reply being generated
+        (closing the stream is what makes LM Studio stop) and kills a running shell command."""
+        self._stopped.set()
+        abort = getattr(self.llm, "abort", None)
+        if abort:
+            abort("stopped")
+        self.toolbox.kill_running()
+
+    def _add_continue(self) -> None:
+        """Our retry mechanism: send "continue". If the last message is the user's, fold it into that
+        message so user/assistant roles still alternate (some chat templates insist on it)."""
+        last = self.messages[-1] if self.messages else None
+        if last and last.get("role") == "user":
+            self._update_last_user(f"{last['content']}\n\ncontinue")
+        else:
+            self._append({"role": "user", "content": "continue"})
+
     def run(self, user_text: str, emit: Emit, approve: Approve,
             unlimited: Callable[[], bool] | None = None) -> None:
         """Run until the model answers without calling tools. The max_steps cap is
         skipped while `unlimited()` is true; it's re-checked before every step, so
-        flipping it mid-run takes effect immediately."""
-        self.messages.append({"role": "user", "content": user_text})
-        steps = 0
+        flipping it mid-run takes effect immediately.
+
+        A reply that runs past the generation limit is stopped, thrown away, and "continue" is sent
+        as a retry (up to max_continues times in a row). stop() ends the run."""
+        emit = self._logging(emit)
+        self._stopped.clear()
+        if self.session:
+            self.session.transcript("user", user_text)
+        last = self.messages[-1] if self.messages else None
+        if last and last.get("role") == "user":  # the previous run died before the model replied: keep roles alternating
+            self._update_last_user(f"{last['content']}\n\n{user_text}")
+        else:
+            self._append({"role": "user", "content": user_text})
+        steps = continues = 0
         while True:
+            if self._stopped.is_set():
+                emit("notice", "Stopped.")
+                return
             if steps >= self.max_steps and not (unlimited and unlimited()):
                 emit("error", f"Stopped after {steps} steps.")
                 return
             steps += 1
             emit("status", "Thinking")
             shown = {"label": "Thinking"}
+            streamed = {"any": False}
 
             def progress(label: str, detail: str) -> None:
                 if label != shown["label"]:
@@ -1130,23 +1611,57 @@ class Agent:
                     emit("status", label)
                 emit("progress", detail)
 
-            msg = self.llm.chat(self.messages, self.toolbox.schemas(), progress=progress)
+            def on_text(channel: str, text: str) -> None:
+                streamed["any"] = True
+                emit("stream_" + channel, text)
+
+            try:
+                msg = self.llm.chat(self.messages, self.toolbox.schemas(), progress=progress,
+                                    on_text=on_text, cancelled=self._stopped.is_set)
+            except GenerationStopped:
+                if streamed["any"]:
+                    emit("stream_end", "aborted")
+                emit("notice", "Stopped.")
+                return
+            except GenerationTimeout as e:
+                if streamed["any"]:
+                    emit("stream_end", "aborted")
+                continues += 1
+                if self.max_continues and continues > self.max_continues:
+                    emit("error", f"{e} That happened {continues} times in a row, so I gave up; "
+                                  "send a message to try again.")
+                    return
+                limit = self.max_continues or "no"
+                emit("notice", f"{e} Sent \"continue\" to retry (retry {continues}, {limit} limit).")
+                self._add_continue()
+                steps -= 1  # a retry isn't progress, so it doesn't eat into the step limit
+                continue
+            continues = 0
+            if streamed["any"]:
+                emit("stream_end", "")
             if msg.get("finish_reason") == "length":
                 emit("error", "The reply hit the model's token limit and was cut off; "
                               "raise the context/max tokens in LM Studio.")
-            hint = summarize_reasoning(msg.get("reasoning_content") or msg.get("reasoning"))
+            reasoning_text = msg.get("reasoning_content") or msg.get("reasoning")
+            if self.session and isinstance(reasoning_text, str) and reasoning_text.strip():
+                self.session.transcript("reasoning", reasoning_text[-LOG_REASONING_CHARS:])
+            hint = summarize_reasoning(reasoning_text)
             if hint:
                 emit("hint", hint)
             calls = msg.get("tool_calls") or []
             entry: dict = {"role": "assistant", "content": msg.get("content") or ""}
             if calls:
                 entry["tool_calls"] = calls
-            self.messages.append(entry)
+            self._append(entry)
             if entry["content"].strip():
                 emit("assistant", entry["content"])
             if not calls:
                 return
             for call in calls:
+                if self._stopped.is_set():  # keep the history valid: every tool call needs a result
+                    self._append({"role": "tool", "tool_call_id": call.get("id", ""),
+                                  "content": "Cancelled: the user stopped the run."})
+                    continue
                 self._run_call(call, emit, approve)
 
     def _run_call(self, call: dict, emit: Emit, approve: Approve) -> None:
@@ -1181,7 +1696,7 @@ class Agent:
                     emit("status", tool_label(name))
                     result = self.toolbox.execute(name, args)
                     emit("result", result[:400])
-        self.messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
+        self._append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
 
 
 # --------------------------------------------------------------------------
@@ -1205,6 +1720,17 @@ def _copy_with_system_tool(text: str) -> bool:
     return False
 
 
+_KIND_STYLES = {"tool": "yellow", "result": "dim", "error": "bold red", "notice": "bold yellow"}
+LIVE_MAX_CHARS = 6000  # a live (still streaming) block shows at most this much of the newest text
+_LIVE_STYLES = {"reasoning": "dim italic", "answer": "", "tool": "dim yellow"}
+
+
+def _tail(text: str, cap: int = LIVE_MAX_CHARS) -> str:
+    if len(text) <= cap:
+        return text
+    return f"{ELLIPSIS} ({len(text) - cap:,} earlier chars not shown)\n" + text[-cap:]
+
+
 class Transcript(VerticalScroll):
     """The scrolling conversation log.
 
@@ -1218,6 +1744,8 @@ class Transcript(VerticalScroll):
     def __init__(self, **kw):
         super().__init__(**kw)
         self.entries: list[str] = []  # plain text of everything added so far
+        self._live: dict[str, Static] = {}  # blocks being streamed right now, by channel
+        self._live_text: dict[str, str] = {}
 
     def on_mount(self) -> None:
         self.anchor()  # follow new output, until the user scrolls up
@@ -1231,8 +1759,33 @@ class Transcript(VerticalScroll):
             self.entries.append(text.plain)
             self.mount(Static(text))
 
+    def stream(self, channel: str, text: str) -> None:
+        """Show text that is still being generated ("reasoning", "answer" or "tool"); call again with the
+        longer text as it grows. Only the newest LIVE_MAX_CHARS are shown so a runaway reply stays cheap."""
+        shown = _tail(text)
+        self._live_text[channel] = shown
+        widget = self._live.get(channel)
+        if widget is None:
+            widget = self._live[channel] = Static(Text(shown, style=_LIVE_STYLES.get(channel, "")), classes="live")
+            self.mount(widget)
+        else:
+            widget.update(Text(shown, style=_LIVE_STYLES.get(channel, "")))
+
+    def end_stream(self, aborted: bool = False) -> None:
+        """The reply is complete. The model's reasoning stays on screen; the live answer and tool-call
+        text are removed (the final reply and tool lines replace them). If it was aborted, keep it all
+        so you can see what the model was doing."""
+        live, texts = self._live, self._live_text
+        self._live, self._live_text = {}, {}
+        for channel, widget in live.items():
+            if aborted or channel == "reasoning":
+                self.entries.append(texts.get(channel, ""))
+            else:
+                widget.remove()
+
     def reset(self) -> None:
         self.entries.clear()
+        self._live, self._live_text = {}, {}
         self.remove_children()
 
 
@@ -1359,7 +1912,7 @@ class AiApp(App):
     TITLE = "ai"
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
-        Binding("ctrl+l", "clear", "New chat"),
+        Binding("ctrl+k", "stop", "Stop", priority=True),
         Binding("ctrl+t", "toggle_activity", "Activity"),
         Binding("ctrl+s", "toggle_supervision", "Supervision: on"),
         Binding("pageup", "log_page_up", "Scroll up", show=False),
@@ -1371,10 +1924,12 @@ class AiApp(App):
     #prompt { dock: bottom; }
     """
 
-    def __init__(self, agent: Agent, initial_prompt: str | None = None):
+    def __init__(self, agent: Agent, initial_prompt: str | None = None, resume: ResumeInfo | None = None):
         super().__init__()
         self.agent = agent
         self.initial_prompt = initial_prompt
+        self.resume = resume  # what to redraw from the session log, if this is a resumed session
+        self._session_error_shown: str | None = None
         self.busy = False
         # True (default): write_file / edit_file / run_shell ask y/n and the agent stops
         # after max_steps. False: they run without asking and the step limit is lifted.
@@ -1392,6 +1947,8 @@ class AiApp(App):
         self.query_one(Input).focus()
         self._write(Text(f"ai ready. Workspace: {self.agent.toolbox.root}\n"
                          "Drag to select text; ctrl+c copies the selection.", style="dim"))
+        if self.resume:
+            self._replay(self.resume)
         if self.initial_prompt:
             self.submit(self.initial_prompt)
 
@@ -1412,15 +1969,56 @@ class AiApp(App):
         _copy_with_system_tool(text)     # pbcopy / wl-copy / xclip / xsel for terminals without OSC 52
 
     def action_clear(self) -> None:
-        self.agent.reset()
+        archived = self.agent.start_new_session()
         self.query_one(Transcript).reset()
-        self._write(Text("Conversation cleared.", style="dim"))
+        note = f" The previous session was saved as {archived.name}." if archived else ""
+        self._write(Text(f"Conversation cleared.{note}", style="dim"))
+
+    def _replay(self, resume: ResumeInfo) -> None:
+        """Redraw the earlier part of a resumed session so you can see where you left off."""
+        entries = resume.transcript
+        shown = entries[-REPLAY_MAX:]
+        self._write(Text(f"Resumed session from {resume.created} ({resume.messages} messages). "
+                         f"Full log: {resume.path.name}", style="bold green"))
+        if len(entries) > len(shown):
+            self._write(Text(f"\u2026 {len(entries) - len(shown)} earlier entries not shown", style="dim"))
+        for rec in shown:
+            kind, text = rec.get("kind"), str(rec.get("text", ""))
+            if kind == "assistant":
+                self._write_markdown(text)
+            elif kind == "user":
+                self._write(Text(f"\n> {text}", style="bold cyan"))
+            elif kind == "reasoning":
+                self._write(Text(_tail(text), style="dim italic"))
+            else:
+                self._write(Text(("  " if kind == "result" else "") + text, style=_KIND_STYLES.get(kind, "")))
+        for note in resume.notes:
+            self._write(Text(note, style="bold yellow"))
+
+    def _log_event(self, name: str, **data) -> None:
+        if self.agent.session:
+            self.agent.session.event(name, **data)
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        if action == "stop":  # only live while the agent is working; otherwise ctrl+k is the prompt's own key
+            return True if self.busy else None
+        return True
+
+    def action_stop(self) -> None:
+        if not self.busy:
+            return
+        self._set_status("Stopping\u2026")
+        self._log_event("stop_pressed")
+        if isinstance(self.screen, ApprovalScreen):
+            self.screen.dismiss(False)
+        self.agent.stop()
 
     def action_toggle_activity(self) -> None:
         self.query_one(ActivityPanel).toggle()
 
     def action_toggle_supervision(self) -> None:
         self.supervision = not self.supervision
+        self._log_event("supervision", on=self.supervision)
         self.title = "ai" if self.supervision else "ai \u2014 UNSUPERVISED"
         self.query_one(ActivityPanel).set_supervised(self.supervision)
         self._set_binding_label("ctrl+s", "Supervision: on" if self.supervision else "Supervision: OFF")
@@ -1456,6 +2054,7 @@ class AiApp(App):
         self.busy = True
         self.sub_title = "thinking..."
         self.query_one(ActivityPanel).start()
+        self.refresh_bindings()
         self.run_agent(text)
 
     # runs in a worker thread; UI updates go through call_from_thread
@@ -1472,7 +2071,13 @@ class AiApp(App):
 
     def _done(self) -> None:
         self.busy = False
+        self.query_one(Transcript).end_stream(aborted=True)  # no-op unless a reply was cut short by an error
+        problem = self.agent.session.error if self.agent.session else None
+        if problem and problem != self._session_error_shown:
+            self._session_error_shown = problem
+            self._write(Text(f"Session log problem: {problem}. This session may not be resumable.", style="bold red"))
         self.query_one(ActivityPanel).stop()
+        self.refresh_bindings()
         self.sub_title = str(self.agent.toolbox.root)
 
     def _set_status(self, label: str) -> None:
@@ -1484,6 +2089,12 @@ class AiApp(App):
     def _set_detail(self, detail: str) -> None:
         self.query_one(ActivityPanel).set_detail(detail)
 
+    def _stream(self, channel: str, text: str) -> None:
+        self.query_one(Transcript).stream(channel, text)
+
+    def _end_stream(self, aborted: bool) -> None:
+        self.query_one(Transcript).end_stream(aborted)
+
     def _emit(self, kind: str, text: str) -> None:
         if kind == "status":
             self.call_from_thread(self._set_status, text)
@@ -1494,10 +2105,16 @@ class AiApp(App):
         if kind == "progress":
             self.call_from_thread(self._set_detail, text)
             return
+        if kind == "stream_end":
+            self.call_from_thread(self._end_stream, text == "aborted")
+            return
+        if kind.startswith("stream_"):
+            self.call_from_thread(self._stream, kind[len("stream_"):], text)
+            return
         if kind == "assistant":
             self.call_from_thread(self._write_markdown, text)
             return
-        style = {"tool": "yellow", "result": "dim", "error": "bold red"}.get(kind, "")
+        style = _KIND_STYLES.get(kind, "")
         self.call_from_thread(self._write, Text(("  " if kind == "result" else "") + text, style=style))
 
     def _approve(self, name: str, args: dict) -> bool:
@@ -1512,7 +2129,7 @@ class AiApp(App):
 
         self.call_from_thread(self.push_screen, ApprovalScreen(name, args), cb)
         while not done.wait(0.25):
-            if not self.is_running:  # app was quit while the prompt was open: deny and let the thread end
+            if not self.is_running or self.agent.stopped():  # quit or stopped while the prompt was open: deny
                 return False
         return answer["ok"]
 
@@ -1539,14 +2156,43 @@ def main() -> None:
     p.add_argument("--url", default=os.getenv("AI_URL", "http://localhost:1234/v1"), help="LM Studio server URL")
     p.add_argument("--model", default=os.getenv("AI_MODEL"), help="model id (default: first loaded model)")
     p.add_argument("--root", default=".", help="workspace directory the agent may touch (default: cwd)")
+    p.add_argument("--generation-timeout", type=float,
+                   default=float(os.getenv("AI_GENERATION_TIMEOUT") or DEFAULT_GENERATION_TIMEOUT),
+                   help="seconds one reply may run before it is stopped and 'continue' is sent to retry "
+                        "(default: 600; 0 = no limit). Breaks loops where the model repeats itself forever")
+    p.add_argument("--max-continues", type=int, default=int(os.getenv("AI_MAX_CONTINUES") or 5),
+                   help="how many generation timeouts in a row to retry before giving up (default: 5; 0 = no limit)")
     p.add_argument("--timeout", type=float, default=float(os.getenv("AI_TIMEOUT") or DEFAULT_TIMEOUT),
                    help="seconds to wait for LM Studio to send *any* data before giving up (default: 600). "
                         "Replies are streamed, so slow generation alone never trips this")
+    p.add_argument("--session", metavar="FILE", default=os.getenv("AI_SESSION"),
+                   help=f"session log to save to and resume from (default: {SESSION_FILE} in the workspace root)")
+    p.add_argument("--new", action="store_true",
+                   help="start a new session; an existing session log is moved aside, not deleted")
+    p.add_argument("--no-session", action="store_true", help="don't save or resume a session")
     a = p.parse_args()
 
     _reattach_tty()
-    agent = Agent(LMStudio(a.url, a.model, timeout=a.timeout), Toolbox(Path(a.root)))
-    AiApp(agent, initial_prompt=" ".join(a.prompt).strip() or None).run()
+    toolbox = Toolbox(Path(a.root))
+    session = None
+    if not a.no_session:
+        session = SessionLog(Path(a.session).expanduser() if a.session else toolbox.root / SESSION_FILE, toolbox.root)
+        toolbox.protect(session.path)
+    llm = LMStudio(a.url, a.model, timeout=a.timeout, generation_timeout=a.generation_timeout)
+    agent = Agent(llm, toolbox, max_continues=a.max_continues, session=session)
+    resume = None
+    try:
+        if session and a.new:
+            session.archive()
+        elif session:
+            resume = agent.resume()
+    except (SessionLocked, SessionVersionError) as e:
+        sys.exit(f"ai: {e}. Close the other ai, or use --session FILE or --no-session.")
+    try:
+        AiApp(agent, initial_prompt=" ".join(a.prompt).strip() or None, resume=resume).run()
+    finally:
+        if session:
+            session.close()
 
 
 if __name__ == "__main__":
