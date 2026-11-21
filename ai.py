@@ -1530,7 +1530,11 @@ class Agent:
         if self.session is None or not self.session.exists():
             return None
         self.session.open()
-        records, skipped = self.session.load()
+        try:
+            records, skipped = self.session.load()
+        except Exception:
+            self.session.close()  # don't keep the lock if the log turns out to be unusable
+            raise
         messages, transcript = restore_history(records)
         self.reset()
         self.messages.extend(messages)
@@ -2187,6 +2191,8 @@ def main() -> None:
         elif session:
             resume = agent.resume()
     except (SessionLocked, SessionVersionError) as e:
+        if session:
+            session.close()
         sys.exit(f"ai: {e}. Close the other ai, or use --session FILE or --no-session.")
     try:
         AiApp(agent, initial_prompt=" ".join(a.prompt).strip() or None, resume=resume).run()
